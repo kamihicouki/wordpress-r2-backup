@@ -104,6 +104,7 @@ namespace {
     if ($scenario==='status409') { $GLOBALS['r2']['objects'][$third]='synthetic ciphertext 2'; $GLOBALS['r2']['faults']['PUT '.$third]=[['status'=>409]]; }
     if ($scenario==='network') { $GLOBALS['r2']['faults']['PUT '.$third]=[['errno'=>7]]; }
     if ($scenario==='tls') { $GLOBALS['r2']['faults']['PUT '.$third]=[['errno'=>60]]; }
+    if ($scenario==='http500') { $GLOBALS['r2']['faults']['PUT '.$third]=[['status'=>500]]; }
     if ($scenario==='status') { $GLOBALS['r2']['faults']['PUT '.$third]=[['status'=>403]]; }
     if ($scenario==='redirect') { $GLOBALS['r2']['faults']['PUT '.$third]=[['status'=>302]]; }
     if ($scenario==='bad-input') { file_put_contents($pages[3]['cipherFile'],str_repeat('x',$pages[3]['object']['bytes'])); }
@@ -115,6 +116,10 @@ namespace {
         check($result===array_column($pages,'object'),'Input order or receipts differ');
         foreach($pages as $page) { $key=$page['object']['key']; check(($GLOBALS['r2']['attempts']['GET '.$key]??0)===1,'Missing full read'); }
         check($GLOBALS['r2']['parallel']===8,'Expected eight concurrent verification requests');
+    }
+    if ($scenario==='http500') {
+        check($failure instanceof \WordPressR2Backup\R2HttpException && $failure->retryNotBefore()===0,'Conditional parallel PUT must be eligible for scheduled recovery');
+        check($GLOBALS['r2']['attempts']['PUT '.$third]===1 && $GLOBALS['r2']['waits']===[],'The transport must not replay the write');
     }
     if ($scenario==='network'||$scenario==='tls') { check(($GLOBALS['r2']['attempts']['PUT '.$third]??0)===1 && $GLOBALS['r2']['waits']===[],'PUT was retried'); }
     if ($scenario==='bad-input') { check($GLOBALS['r2']['events']===[],'PUT started before all files were hashed'); }

@@ -14,7 +14,7 @@ final class R2ParallelPagePutTest extends TestCase
         self::assertIsResource($process);$exit=proc_close($process);rewind($out);rewind($err);$body=stream_get_contents($out);$error=stream_get_contents($err);fclose($out);fclose($err);
         self::assertSame(0,$exit,$body.$error);self::assertSame('ok '.$scenario."\n",$body);
     }
-    public function scenarios(): array { return array_map(static fn(string $scenario): array => [$scenario],['success','existing','status409','conflict','network','tls','status','redirect','bad-input']); }
+    public function scenarios(): array { return array_map(static fn(string $scenario): array => [$scenario],['success','existing','status409','conflict','network','tls','status','http500','redirect','bad-input']); }
 
     public function testInjectedTransportRemainsSerialAndRechecksExistingObjects(): void
     {
