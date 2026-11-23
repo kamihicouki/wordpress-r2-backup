@@ -16,9 +16,9 @@ final class Restorer
         $this->reader = $reader;
     }
 
-    public function restore(string $snapshotId, $identityStream, string $newDestination, ?RecoveryDatabase $database = null, ?string $newDatabase = null, ?callable $captureSummary = null, ?string $localMediaDryRunPrefix = null, ?callable $phaseListener = null): array
+    public function restore(string $snapshotId, $identityStream, string $newDestination, ?RecoveryDatabase $database = null, ?string $newDatabase = null, ?callable $captureSummary = null, ?string $localMediaDryRunPrefix = null, ?callable $phaseListener = null, ?callable $progressListener = null): array
     {
-        return $this->routeRecovery($snapshotId, $identityStream, $newDestination, $database, $newDatabase, false, $captureSummary, $localMediaDryRunPrefix, $phaseListener);
+        return $this->routeRecovery($snapshotId, $identityStream, $newDestination, $database, $newDatabase, false, $captureSummary, $localMediaDryRunPrefix, $phaseListener, $progressListener);
     }
 
     public function resume(string $snapshotId, $identityStream, string $newDestination, ?RecoveryDatabase $database = null, ?string $newDatabase = null, ?callable $captureSummary = null, ?string $localMediaDryRunPrefix = null): array
@@ -53,7 +53,8 @@ final class Restorer
     /** Decrypts the root manifest only: what a screen shows and binds before any recovery work. Referenced objects are not read. */
     public function describe(string $snapshotId, $identityStream): array
     {
-        $receipt = $this->completed($snapshotId);
+        $receipt = ($this->reader instanceof DirectR2Repository || $this->reader instanceof LocalRepository)
+            ? $this->reader->completionMetadata($snapshotId)['manifest'] : $this->completed($snapshotId);
         $identity = $this->identity($identityStream);
         $workspace = realpath(sys_get_temp_dir()) . '/wrb-describe-' . bin2hex(random_bytes(16));
         if (!mkdir($workspace, 0700)) { fclose($identity); throw new RuntimeException('Cannot create an inspection workspace.'); }
@@ -172,7 +173,7 @@ final class Restorer
         }
     }
 
-    private function routeRecovery(string $snapshotId, $input, string $destination, ?RecoveryDatabase $database, ?string $schema, bool $resume, ?callable $summary, ?string $localMediaDryRunPrefix, ?callable $phaseListener = null): array
+    private function routeRecovery(string $snapshotId, $input, string $destination, ?RecoveryDatabase $database, ?string $schema, bool $resume, ?callable $summary, ?string $localMediaDryRunPrefix, ?callable $phaseListener = null, ?callable $progressListener = null): array
     {
         $identity = $this->identity($input);
         $workspace = dirname($this->workspace($snapshotId, $destination)) . '/.wrb-route-' . bin2hex(random_bytes(16));
@@ -182,7 +183,7 @@ final class Restorer
             $manifest = $this->manifest($snapshotId, $receipt, $identity, $workspace);
             rewind($identity);
             if ($manifest['version'] === 4) {
-                return (new V4Restorer($this->age, $this->reader))->recover($manifest, $receipt, $identity, $destination, $database, $schema, $resume, $summary, $localMediaDryRunPrefix, $phaseListener);
+                return (new V4Restorer($this->age, $this->reader))->recover($manifest, $receipt, $identity, $destination, $database, $schema, $resume, $summary, $localMediaDryRunPrefix, $phaseListener, $progressListener);
             }
             if ($localMediaDryRunPrefix !== null) { throw new RuntimeException('Local media dry run requires a version 4 snapshot.'); }
             if ($database !== null && !($database instanceof MysqlClient)) { throw new RuntimeException('SQLite recovery requires a version 4 snapshot.'); }

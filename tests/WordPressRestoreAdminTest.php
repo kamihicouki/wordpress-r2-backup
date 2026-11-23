@@ -24,7 +24,8 @@ final class WordPressRestoreAdminTest extends TestCase
         self::assertStringContainsString('既存のデータベース、別のサーバーのデータベース、マルチサイト', $html, 'The supported range is stated on the screen');
         self::assertStringNotContainsString('<script>', $html, 'Values are escaped');
         self::assertStringContainsString('name="reauthPassword"', $html);
-        foreach (['確認用アドレス', '新しいアドレス', 'AGE-SECRET-KEY-1', 'restore-admin'] as $text) { self::assertStringContainsString($text, $html); }
+        foreach (['動作確認用のURL', 'サイトアドレス (URL)', 'WordPress アドレス (URL)', 'URLの優先順位と、公開前に必要な設定', 'AGE-SECRET-KEY-1', 'restore-admin'] as $text) { self::assertStringContainsString($text, $html); }
+        self::assertStringContainsString('name="urlMode" value="keep" checked', $html);
         preg_match_all('/<span aria-hidden="true">(\d)<\/span>/', $html, $steps);
         self::assertSame(['1', '2', '3', '4'], $steps[1], 'Visible step numbers run without a gap');
         foreach (['接続セット', '起動コピー', '世代', '復元名', 'DBへ'] as $jargon) { self::assertStringNotContainsString($jargon, $html, $jargon); }
@@ -42,6 +43,7 @@ final class WordPressRestoreAdminTest extends TestCase
 namespace {
 function current_user_can($c) { return true; }
 function is_multisite() { return false; }
+function is_ssl() { return true; }
 function admin_url($p = '') { return '/wp-admin/' . $p; }
 function wp_create_nonce($a) { return 'nonce'; }
 function esc_url($u) { return (string) $u; }
@@ -61,7 +63,7 @@ CODE
         $views = json_decode((string) $output, true);
         self::assertIsArray($views, $output . $error);
         self::assertSame(1, substr_count($views['none'], '未設定'), 'One notice');
-        self::assertStringNotContainsString('id="wrb-restore"', $views['none'], 'No form that cannot work');
+        self::assertStringContainsString('data-r2-file', $views['none'], 'A connection file can be selected without saved settings');
         self::assertStringNotContainsString('未設定', $views['set']);
         self::assertStringContainsString('<details class="wrb-panel wrb-r-admin-tools">', $views['set'], 'Closed by default');
         self::assertGreaterThan(strpos($views['set'], 'id="wrb-restore"'), strpos($views['set'], 'wrb-r-admin-tools'), 'Below the form');
@@ -78,9 +80,10 @@ CODE
 namespace {
 define('ABSPATH', sys_get_temp_dir() . '/wrb-no-such-site/');
 define('WRB_RESTORE_STATE_DIR', __STATE__);
-$GLOBALS['t'] = []; $GLOBALS['caps'] = true; $GLOBALS['nonce'] = true; $GLOBALS['uid'] = 5; $GLOBALS['session'] = 'one'; $GLOBALS['checks'] = 0;
+$GLOBALS['t'] = []; $GLOBALS['caps'] = true; $GLOBALS['nonce'] = true; $GLOBALS['uid'] = 5; $GLOBALS['session'] = 'one'; $GLOBALS['checks'] = 0; $GLOBALS['ssl'] = false;
 function current_user_can($c) { return $GLOBALS['caps']; }
 function is_multisite() { return false; }
+function is_ssl() { return $GLOBALS['ssl']; }
 function wp_die($m = '', $t = '', $a = []) { throw new \RuntimeException('die:' . ($a['response'] ?? 0)); }
 function check_ajax_referer($a, $f) { if (!$GLOBALS['nonce']) { throw new \RuntimeException('die:nonce'); } }
 function nocache_headers() {}
@@ -102,6 +105,10 @@ $call = static function (array $post) { $_POST = $post; try { \WordPressR2Backup
 $out = [];
 $GLOBALS['caps'] = false; $out['noCapability'] = $call(['command' => 'status']); $GLOBALS['caps'] = true;
 $GLOBALS['nonce'] = false; $out['badNonce'] = $call(['command' => 'status']); $GLOBALS['nonce'] = true;
+$_SERVER['REMOTE_ADDR'] = '192.0.2.1'; $_SERVER['HTTP_HOST'] = 'example.invalid';
+$out['httpKey'] = $call(['command' => 'preflight', 'identity' => 'synthetic identity']);
+$out['httpConnection'] = $call(['command' => 'snapshots', 'r2Connection' => 'synthetic profile']);
+$GLOBALS['ssl'] = true;
 for ($i = 0; $i < 6; $i++) { $last = $call(['command' => 'start', 'reauthPassword' => 'wrong']); }
 $out['lockedAfterFailures'] = $last; $out['checks'] = $GLOBALS['checks'];
 $before = \WordPressR2Backup\WordPressRestoreAdmin::actor(); $GLOBALS['session'] = 'two'; $otherSession = \WordPressR2Backup\WordPressRestoreAdmin::actor(); $GLOBALS['uid'] = 6; $otherUser = \WordPressR2Backup\WordPressRestoreAdmin::actor();
@@ -116,6 +123,8 @@ CODE
         self::assertIsArray($result, $output . $error);
         self::assertSame('die:403', $result['noCapability']);
         self::assertSame('die:nonce', $result['badNonce']);
+        self::assertStringContainsString('"field":"identity"', $result['httpKey']);
+        self::assertStringContainsString('"field":"r2Connection"', $result['httpConnection']);
         self::assertSame(5, $result['checks'], 'Past the limit the password is no longer even checked');
         self::assertStringStartsWith('err:400', $result['lockedAfterFailures']);
         self::assertStringContainsString('reauthPassword', $result['lockedAfterFailures']);

@@ -13,13 +13,14 @@ use RuntimeException;
 final class MysqlSiteSetup
 {
     /** @param array{user:string,password:string} $runner */
-    public function prepare(MysqlClient $client, string $originalSchema, string $runningSchema, array $runner, string $socket, string $sourceWordPressRoot, string $newSiteRoot, string $sourceUrl, string $localUrl, ?string $targetUrl, string $tablePrefix, array $administrator, array $sourceAliases, string $workspace): array
+    public function prepare(MysqlClient $client, string $originalSchema, string $runningSchema, array $runner, string $socket, string $sourceWordPressRoot, string $newSiteRoot, string $sourceUrl, string $localUrl, ?string $targetUrl, string $tablePrefix, array $administrator, array $sourceAliases, string $workspace, ?string $migrationDatabase = null): array
     {
         if (!preg_match('/\A[A-Za-z0-9_]{1,64}\z/D', $tablePrefix)) { throw new RuntimeException('Invalid WordPress table prefix.'); }
         SiteUrlRewriter::assertUrl($sourceUrl, false); SiteUrlRewriter::assertUrl($localUrl, true);
         if ($targetUrl !== null) { SiteUrlRewriter::assertUrl($targetUrl, false); $targetUrl = rtrim($targetUrl, '/'); }
         $localUrl = rtrim($localUrl, '/'); $storedUrl = $targetUrl ?? $localUrl;
-        $replacements = SiteUrlRewriter::replacements(rtrim($sourceUrl, '/'), $storedUrl, $sourceAliases);
+        $preserveUrls = rtrim($sourceUrl, '/') === $storedUrl && $sourceAliases === [];
+        $replacements = $preserveUrls ? [] : SiteUrlRewriter::replacements(rtrim($sourceUrl, '/'), $storedUrl, $sourceAliases);
         SiteUrlRewriter::assertAdministrator($administrator);
         FileSafety::assertNoLinks($sourceWordPressRoot); FileSafety::assertNoLinks($newSiteRoot); FileSafety::privateDirectory(dirname($newSiteRoot)); FileSafety::privateDirectory($workspace);
         if (realpath($sourceWordPressRoot) !== $sourceWordPressRoot || !is_dir($sourceWordPressRoot)) { throw new RuntimeException('The restored source must be canonical.'); }
@@ -39,10 +40,14 @@ final class MysqlSiteSetup
         $writer = new PDO($dsn, $runner['user'], $runner['password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::MYSQL_ATTR_LOCAL_INFILE => false]);
         $reader = new PDO($dsn, $runner['user'], $runner['password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::MYSQL_ATTR_LOCAL_INFILE => false, PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => false]);
         $rewriter = new SiteUrlRewriter();
-        $updated = $rewriter->rewrite($reader, $writer, $replacements);
+        $updated = 0;
+        if (!$preserveUrls) {
+            $updated = $rewriter->rewrite($reader, $writer, $replacements);
+            $rewriter->setOption($writer, $tablePrefix . 'options', 'home', $storedUrl);
+            $rewriter->setOption($writer, $tablePrefix . 'options', 'siteurl', $storedUrl);
+        }
         $reader = null;
-        $rewriter->setOption($writer, $tablePrefix . 'options', 'home', $storedUrl);
-        $rewriter->setOption($writer, $tablePrefix . 'options', 'siteurl', $storedUrl);
+        if ($migrationDatabase !== null) { $client->dump($runningSchema, $migrationDatabase); }
         if ($administrator !== []) { $rewriter->createAdministrator($writer, $tablePrefix, $administrator); }
         $writer = null;
         $content = $newSiteRoot . '/wp-content';

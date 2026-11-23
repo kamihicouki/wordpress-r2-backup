@@ -97,6 +97,7 @@ final class RestoreServiceTest extends TestCase
         self::assertSame('not-started', $status['site']['state'], 'Nothing starts by itself');
         $job = $this->base($service) . '/jobs/sqlite-flow';
         self::assertDirectoryDoesNotExist($job . '/restore/roots/r0001/wp-content/uploads');
+        self::assertSame('0', RestoreTestBed::sqliteValue($status['startup']['migrationDatabase'], "SELECT COUNT(*) FROM wp_users WHERE user_login='restore-admin'"));
         $running = $job . '/running-db/site.sqlite'; $original = $job . '/original-db/site.sqlite';
         self::assertSame(RestoreTestBed::TARGET_URL, RestoreTestBed::sqliteValue($running, "SELECT option_value FROM wp_options WHERE option_name='home'"));
         self::assertSame(RestoreTestBed::SOURCE_URL, RestoreTestBed::sqliteValue($original, "SELECT option_value FROM wp_options WHERE option_name='home'"), 'The original stays unchanged');
@@ -110,6 +111,7 @@ final class RestoreServiceTest extends TestCase
         self::assertContains($started['site']['state'], ['starting', 'running']);
         $ready = $this->untilSite($service, 'sqlite-flow');
         self::assertTrue($ready['site']['openable']);
+        self::assertTrue($ready['site']['adminOpenable']);
         self::assertStringContainsString('"database":"sqlite"', RestoreTestBed::http($port, 'GET', '/__wrb_isolation_check')[2]);
         $this->assertPreviewClean($port);
         $listener = stream_socket_server('tcp://127.0.0.1:0');
@@ -123,13 +125,99 @@ final class RestoreServiceTest extends TestCase
         $this->assertNoSecret($job, [self::$bed->identity, RestoreTestBed::ADMIN_PASSWORD]);
     }
 
+    public function testBlankUrlAndAdministratorOptOutKeepTheBackedUpUserAndOriginalAddress(): void
+    {
+        $service = $this->service(); $port = RestoreTestBed::freePort();
+        $input = self::$bed->input('keep-source', $port, ['targetUrl' => '', 'createPreviewAdmin' => '0']);
+        $status = $this->run_($service, $input, self::$bed->secrets(['adminPassword' => '']));
+        self::assertSame('complete', $status['state'], json_encode($status, JSON_UNESCAPED_UNICODE));
+        self::assertTrue($status['startup']['hasBackedUpUsers']);
+        $job = $this->base($service) . '/jobs/keep-source';
+        $sqliteTemp = $job . '/sqlite-tmp';
+        self::assertDirectoryExists($sqliteTemp);
+        self::assertSame(0700, fileperms($sqliteTemp) & 0777);
+        self::assertSame(['.', '..'], scandir($sqliteTemp));
+        $db = $job . '/running-db/site.sqlite';
+        self::assertSame(RestoreTestBed::SOURCE_URL, RestoreTestBed::sqliteValue($db, "SELECT option_value FROM wp_options WHERE option_name='home'"));
+        self::assertSame('1', RestoreTestBed::sqliteValue($db, "SELECT COUNT(*) FROM wp_users WHERE user_login='synthetic'"));
+        self::assertSame('0', RestoreTestBed::sqliteValue($db, "SELECT COUNT(*) FROM wp_users WHERE user_login='restore-admin'"));
+        $service->startSite('keep-source'); $this->untilSite($service, 'keep-source');
+        [$code, , $body] = RestoreTestBed::http($port, 'GET', '/wp-admin/');
+        self::assertSame(200, $code);
+        self::assertStringNotContainsString(RestoreTestBed::SOURCE_URL, $body);
+    }
+
+    /** @dataProvider guidanceDatabases */
+    public function testPublicationConfigGuidanceKeepsOriginalOptionsAndContent(string $database): void
+    {
+        if ($database === 'mysql' && !IsolatedMysql::available('mariadb')) { self::markTestSkipped('MariaDB is not configured.'); }
+        $bed = $database === 'mysql' ? RestoreTestBed::build('mariadb') : self::$bed;
+        try {
+            $set = $database === 'mysql' ? RestoreTestBed::connectionSet($bed->server, 'target') : null;
+            $service = new RestoreService($bed->environment(Fixture::temp(), $set === null ? [] : [$set]));
+            $input = $bed->input('config-guidance', RestoreTestBed::freePort(), ['database' => $database, 'connection' => 'target',
+                'urlMode' => 'config', 'targetSiteUrl' => RestoreTestBed::TARGET_URL . '/wordpress', 'createPreviewAdmin' => '0']);
+            $secrets = $bed->secrets(['adminPassword' => '']);
+            $review = $service->preflight($input, $secrets, 'actor-a');
+            self::assertTrue($review['ok']);
+            self::assertSame('config', $review['summary']['urlMode']);
+            self::assertArrayNotHasKey('restoredUrls', $review['summary']);
+            $status = $this->run_($service, $input, $secrets);
+            self::assertSame('complete', $status['state'], json_encode($status, JSON_UNESCAPED_UNICODE));
+            self::assertSame($review['summary']['publicationUrls'], $status['startup']['publicationUrls']);
+            self::assertSame(['home' => RestoreTestBed::SOURCE_URL, 'siteurl' => RestoreTestBed::SOURCE_URL], $status['restoredUrls']['database']);
+            self::assertSame(0, $status['startup']['urlFieldsUpdated']);
+            $job = $this->base($service) . '/jobs/config-guidance';
+            self::assertFileDoesNotExist($job . '/migration-db');
+            self::assertStringNotContainsString(RestoreTestBed::TARGET_URL, (string) file_get_contents($job . '/site/wp-config.php'));
+            if ($set !== null) {
+                self::assertSame($bed->server->client()->tableChecksums($set['_schema']), $bed->server->client()->tableChecksums($set['_schema'] . '_run'));
+            } else {
+                $contents = static function (string $file): array {
+                    $db = new \SQLite3($file, SQLITE3_OPEN_READONLY);
+                    $db->enableExceptions(true);
+                    try {
+                        $rows = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'wp_*' ORDER BY name");
+                        $tables = [];
+                        while (($table = $rows->fetchArray(SQLITE3_NUM)) !== false) {
+                            $tables[$table[0]] = [];
+                            $data = $db->query('SELECT * FROM "' . str_replace('"', '""', $table[0]) . '" ORDER BY rowid');
+                            while (($row = $data->fetchArray(SQLITE3_NUM)) !== false) { $tables[$table[0]][] = $row; }
+                            $data->finalize();
+                        }
+                        return $tables;
+                    } finally { $db->close(); }
+                };
+                self::assertSame($contents($job . '/original-db/site.sqlite'), $contents($job . '/running-db/site.sqlite'));
+            }
+        } finally { if ($database === 'mysql') { $bed->server->stop(); } }
+    }
+
+    public function guidanceDatabases(): array { return [['sqlite'], ['mysql']]; }
+
+    public function testDatabaseMigrationStopsBeforeCopyingWhenTheRecordedUrlDisagreesWithTheDatabase(): void
+    {
+        $bed = RestoreTestBed::build('mysql', null, 'https://recorded.example.net');
+        try {
+            $service = new RestoreService($bed->environment(Fixture::temp()));
+            $status = $this->run_($service, $bed->input('mismatch', RestoreTestBed::freePort(), ['urlMode' => 'database']), $bed->secrets());
+            self::assertSame('startup-failed', $status['state']);
+            self::assertSame('verified', $status['results']['database']['state']);
+            self::assertSame(RestoreTestBed::SOURCE_URL, $status['restoredUrls']['database']['home']);
+            self::assertFalse($status['restoredUrls']['configuration']['home']);
+            $job = $this->base($service) . '/jobs/mismatch';
+            self::assertDirectoryDoesNotExist($job . '/migration-db');
+            self::assertDirectoryDoesNotExist($job . '/site');
+        } finally { $bed->server->stop(); }
+    }
+
     /** @dataProvider engines */
     public function testMysqlFromFormToIsolatedPreviewProtectsTheOriginalFromTheRunningAccount(string $engine): void
     {
         $bed = self::$bed;
-        if ($engine === 'mariadb105') {
-            if (!IsolatedMysql::mariadb105Available()) { self::markTestSkipped('The MariaDB 10.5 runtime is not installed.'); }
-            $bed = RestoreTestBed::build('mariadb105');
+        if ($engine !== 'mysql') {
+            if (!IsolatedMysql::available($engine)) { self::markTestSkipped('The requested MariaDB runtime is not configured.'); }
+            $bed = RestoreTestBed::build($engine);
         }
         $server = $bed->server;
         try {
@@ -144,6 +232,10 @@ final class RestoreServiceTest extends TestCase
             $serialized = unserialize($server->rows($run, "SELECT option_value FROM wp_options WHERE option_name='wrb_serialized'")[0][0]);
             self::assertSame(RestoreTestBed::TARGET_URL . '/page', $serialized['url']); self::assertSame('https://source.invalid.example/x', $serialized['keep']);
             self::assertSame([['1']], $server->rows($run, "SELECT COUNT(*) FROM wp_users WHERE user_login='restore-admin'"));
+            $migration = $server->newSchema();
+            $server->client()->importIntoEmpty($migration, $status['startup']['migrationDatabase'], []);
+            self::assertSame([[RestoreTestBed::TARGET_URL]], $server->rows($migration, "SELECT option_value FROM wp_options WHERE option_name='home'"));
+            self::assertSame([['0']], $server->rows($migration, "SELECT COUNT(*) FROM wp_users WHERE user_login='restore-admin'"));
             self::assertFileDoesNotExist($server->workspace() . '/importer-' . $schema . '.cnf', 'Client settings end with the job');
             self::assertSame([], glob($server->workspace() . '/.wrb-restore-inspect-*') ?: []);
             $service->startSite('mysql-flow');
@@ -168,7 +260,7 @@ final class RestoreServiceTest extends TestCase
         } finally { if ($engine !== 'mysql') { foreach ($this->services as [$running, $job]) { try { $running->stopSite($job); } catch (\Throwable $ignored) { } } $server->stop(); } }
     }
 
-    public function engines(): array { return ['MySQL 8.0' => ['mysql'], 'MariaDB 10.5' => ['mariadb105']]; }
+    public function engines(): array { return ['MySQL 8.0' => ['mysql'], 'MariaDB 10.5' => ['mariadb105'], 'MariaDB 10.11' => ['mariadb']]; }
 
     public function testChangesAfterTheCheckExpireTheConfirmation(): void
     {
@@ -283,6 +375,9 @@ final class RestoreServiceTest extends TestCase
         $status = $service->start($input, $secrets, $hash, 'slow', 'a'); $this->services[] = [$service, 'slow'];
         self::assertLessThan(5.0, microtime(true) - $began, 'The request returns after handing over, not at the end of the work');
         self::assertContains($status['state'], ['queued', 'running'], json_encode($status, JSON_UNESCAPED_UNICODE));
+        self::assertSame(RestoreTestBed::TARGET_URL, $status['site']['publication']['home']);
+        self::assertSame('http://127.0.0.1:' . $port, $status['site']['previewUrl']);
+        self::assertFalse($status['site']['openable']);
         $review = $service->preflight(self::$bed->input('second', $port), $secrets, 'a');
         self::assertFalse($review['ok'], 'A second restore waits for the first');
         self::assertSame('exclusive', array_column($review['checks'], 'id')[1]);
@@ -319,13 +414,14 @@ final class RestoreServiceTest extends TestCase
         self::assertSame('startup-failed', $status['state'], json_encode($status, JSON_UNESCAPED_UNICODE));
         self::assertSame('verified', $status['results']['database']['state']); self::assertSame('failed', $status['results']['startup']['state']);
         $job = $this->base($service) . '/jobs/retry'; $original = hash_file('sha256', $job . '/original-db/site.sqlite');
+        self::assertDirectoryDoesNotExist($job . '/site', 'An unverified URL source stops before the startup copy is made');
         $this->assertRefused(fn () => $service->retryStartup('retry', ['tablePrefix' => '../bad'], self::$bed->secrets()), 'a bad prefix');
         $service->retryStartup('retry', ['tablePrefix' => 'wp_'], self::$bed->secrets());
         $status = $this->finish($service, 'retry');
         self::assertSame('complete', $status['state'], json_encode($status, JSON_UNESCAPED_UNICODE));
         self::assertSame($original, hash_file('sha256', $job . '/original-db/site.sqlite'), 'The original database is not imported again');
-        self::assertDirectoryExists($job . '/site-2');
-        self::assertSame(RestoreTestBed::TARGET_URL, RestoreTestBed::sqliteValue($job . '/running-db-2/site.sqlite', "SELECT option_value FROM wp_options WHERE option_name='home'"));
+        self::assertDirectoryExists($job . '/site');
+        self::assertSame(RestoreTestBed::TARGET_URL, RestoreTestBed::sqliteValue($job . '/running-db/site.sqlite', "SELECT option_value FROM wp_options WHERE option_name='home'"));
     }
 
     public function testDatabaseImportFailureIsNotRepeated(): void
@@ -441,6 +537,20 @@ final class RestoreServiceTest extends TestCase
         $root = Fixture::temp();
         file_put_contents($root . '/wp-config.php', "<?php\n// define('MULTISITE', true);\n/* define('WP_SITEURL', 'https://x.example/wp'); */\ndefine('WP_CONTENT_URL', 'https://cdn.example/c');\ndefine('UPLOADS', 'files');\ndefine('WP_ALLOW_MULTISITE', false);\n");
         self::assertSame(['WP_CONTENT_URL', 'UPLOADS'], \WordPressR2Backup\RestoredSiteCheck::assertSupported(['wp_options'], ['home' => 'https://a.example/', 'siteurl' => 'https://a.example'], 'wp_', $root));
+    }
+
+    public function testArchivedConfigurationIsNotExecutedAndNonstandardIncludesAreNotConfirmed(): void
+    {
+        $root = Fixture::temp(); $config = $root . '/wp-config.php';
+        $inspect = static function () use ($root): array { return \WordPressR2Backup\RestoredSiteCheck::inspect(['wp_options'], ['home' => 'https://a.example', 'siteurl' => 'https://a.example'], 'wp_', $root); };
+        self::assertFalse($inspect()['configurationPresent']);
+        file_put_contents($config, "<?php\n// include 'not-real.php';\nrequire_once ABSPATH . 'wp-settings.php';\n");
+        self::assertFalse($inspect()['configurationIncomplete']);
+        file_put_contents($config, "<?php\nrequire __DIR__ . '/unavailable.php';\n");
+        $original = $inspect();
+        self::assertTrue($original['configurationPresent']);
+        self::assertTrue($original['configurationIncomplete']);
+        self::assertFalse($original['configuration']['home']['mentioned']);
     }
 
     public function testASubdirectorySiteStopsOnlyTheStartupStageInBothDatabaseModes(): void

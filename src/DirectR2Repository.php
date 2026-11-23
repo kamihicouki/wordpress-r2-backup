@@ -62,12 +62,25 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         }
         $body = @file_get_contents($privatepath, false, null, 0, 8193);
         if (!is_string($body) || strlen($body) > 8192) { throw new RuntimeException('Cannot read R2 connection file.'); }
+        return self::fromContents($body);
+    }
+
+    /** Parse a bounded connection file in memory, without persisting credentials. */
+    public static function fromContents(string $body): self
+    {
+        return new self(self::connectionFromContents($body));
+    }
+
+    public static function connectionFromContents(string $body): array
+    {
+        if (strlen($body) > 8192) { throw new RuntimeException('R2 connection is too large.'); }
         $profile = self::decode($body);
         if (($profile['format'] ?? null) !== 'wrb-direct-r2-v1' || ($profile['version'] ?? null) !== 1) {
             throw new RuntimeException('Invalid R2 connection format.');
         }
         unset($profile['format'], $profile['version']);
-        return new self($profile);
+        new self($profile); // Apply exactly the same field and endpoint validation.
+        return $profile;
     }
 
     public function unitId(): string { return $this->connection['unitId']; }
@@ -355,6 +368,26 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         $record = $this->completionRecord($snapshotId);
         $this->verifyMany(array_merge([$record['manifest']], $record['objects'] ?? []));
         return $record;
+    }
+
+    /** Only checks the completion record; referenced objects remain unverified until recovery. */
+    public function completionMetadata(string $snapshotId): array
+    {
+        self::identifier($snapshotId);
+        return $this->completionRecord($snapshotId);
+    }
+
+    public function listCandidates(): array
+    {
+        $result = [];
+        foreach ($this->snapshotIds() as $id) {
+            try {
+                $record = $this->completionMetadata($id);
+                $result[] = ['snapshotId' => $id, 'valid' => true, 'verified' => false, 'savedAt' => $record['createdAt'] ?? null];
+            }
+            catch (\Throwable $ignored) { $result[] = ['snapshotId' => $id, 'valid' => false, 'verified' => false]; }
+        }
+        return $result;
     }
 
     public function listCompleted(): array

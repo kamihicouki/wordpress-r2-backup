@@ -17,14 +17,15 @@ final class AgeProcessTest extends TestCase
 
     protected function setUp(): void
     {
-        $this->binary = getenv('WRB_AGE_BIN') ?: (require __DIR__ . '/runtime.php')['age'];
+        $runtime = Fixture::runtime();
+        $this->binary = $runtime['age'];
         $this->directory = realpath(sys_get_temp_dir()) . '/wrb-age-test-' . bin2hex(random_bytes(12));
         self::assertTrue(mkdir($this->directory, 0700));
         for ($i = 0; $i < 3; $i++) {
             $identity = $this->directory . '/identity-' . $i;
-            $this->command([dirname($this->binary) . '/age-keygen', '-o', $identity]);
+            $this->command([$runtime['keygen'], '-o', $identity]);
             $this->identities[] = $identity;
-            $this->recipients[] = trim($this->command([dirname($this->binary) . '/age-keygen', '-y', $identity]));
+            $this->recipients[] = trim($this->command([$runtime['keygen'], '-y', $identity]));
         }
     }
 

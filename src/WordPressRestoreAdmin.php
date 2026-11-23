@@ -13,18 +13,17 @@ final class WordPressRestoreAdmin
         add_action('wp_ajax_wrb_restore', [self::class, 'ajax']);
         add_action('admin_enqueue_scripts', static function (string $hook) use ($pluginFile): void {
             if (!in_array($hook, ['tools_page_' . WordPressAdmin::PAGE, 'toplevel_page_' . WordPressAdmin::PAGE], true) || defined('WRB_SYNTHETIC_RUNTIME_PROFILE') || LiveAdmin::view() !== 'restore') { return; }
-            wp_enqueue_style('wrb-restore', plugins_url('assets/restore.css', $pluginFile), [], '0.6.0');
-            wp_enqueue_script('wrb-restore', plugins_url('assets/restore.js', $pluginFile), [], '0.6.0', true);
+            wp_enqueue_style('wrb-restore', plugins_url('assets/restore.css', $pluginFile), [], '0.7.0');
+            wp_enqueue_script('wrb-restore', plugins_url('assets/restore.js', $pluginFile), [], '0.7.0', true);
         });
     }
 
     public static function render(?array $settings): void
     {
         self::authorize();
-        if ($settings === null && !defined('WRB_RESTORE_LOCAL_REPOSITORY')) { return; }
         global $wpdb;
         echo RestorePage::render(['endpoint' => admin_url('admin-ajax.php'), 'tokenName' => '_wrb_restore_nonce', 'token' => wp_create_nonce('wrb_restore'), 'extra' => ['action' => 'wrb_restore'], 'reauth' => true,
-            'prefix' => is_object($wpdb) && isset($wpdb->prefix) && is_string($wpdb->prefix) ? $wpdb->prefix : 'wp_']);
+            'secureTransport' => self::secureTransport(), 'prefix' => is_object($wpdb) && isset($wpdb->prefix) && is_string($wpdb->prefix) ? $wpdb->prefix : 'wp_']);
     }
 
     public static function ajax(): void
@@ -35,9 +34,14 @@ final class WordPressRestoreAdmin
         $post = wp_unslash($_POST);
         $command = is_array($post) && is_string($post['command'] ?? null) ? $post['command'] : '';
         try {
+            if (!self::secureTransport()) {
+                $secrets = array_intersect_key((array) $post, RestorePlan::SECRET_FIELDS + ['reauthPassword' => 4096]);
+                foreach ($secrets as $field => $value) {
+                    if ($value !== '') { throw new RestoreError('秘密情報を送るにはHTTPSが必要です。', $field); }
+                }
+            }
             if ($command === 'start') { self::reauthenticate((string) ($post['reauthPassword'] ?? '')); }
             $settings = LiveSettings::load();
-            if ($settings === null && !defined('WRB_RESTORE_LOCAL_REPOSITORY')) { throw new RestoreError('保存先が未設定です。'); }
             [$code, $body] = RestoreApi::handle(new RestoreService(self::environment($settings)), $command, is_array($post) ? $post : [], self::actor());
         } catch (RestoreError $error) {
             [$code, $body] = [400, ['error' => $error->getMessage(), 'field' => $error->field()]];
@@ -70,6 +74,7 @@ final class WordPressRestoreAdmin
     private static function source(?array $settings): array
     {
         if (defined('WRB_RESTORE_LOCAL_REPOSITORY')) { return ['type' => 'repository', 'path' => (string) constant('WRB_RESTORE_LOCAL_REPOSITORY'), 'unit' => defined('WRB_RESTORE_LOCAL_UNIT') ? (string) constant('WRB_RESTORE_LOCAL_UNIT') : '']; }
+        if ($settings === null) { return ['type' => 'unconfigured']; }
         return ['type' => 'direct-r2', 'profile' => array_intersect_key((array) $settings, array_flip(['accountId', 'bucket', 'accessKeyId', 'secretAccessKey', 'unitId']))];
     }
 
@@ -89,6 +94,11 @@ final class WordPressRestoreAdmin
         $address = is_string($server['REMOTE_ADDR'] ?? null) ? $server['REMOTE_ADDR'] : '';
         $host = is_string($server['HTTP_HOST'] ?? null) ? strtolower(preg_replace('/:[0-9]+\z/D', '', $server['HTTP_HOST'])) : '';
         return in_array($address, ['127.0.0.1', '::1'], true) && (in_array($host, ['localhost', '127.0.0.1', '[::1]'], true) || preg_match('/\.(?:localhost|local|test)\z/D', $host) === 1);
+    }
+
+    private static function secureTransport(): bool
+    {
+        return is_ssl() || self::viewerLocal($_SERVER);
     }
 
     private static function authorize(): void

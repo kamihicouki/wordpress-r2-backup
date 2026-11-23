@@ -18,7 +18,7 @@ final class V4Restorer
         $this->reader = $reader;
     }
 
-    public function recover(array $manifest, array $receipt, $input, string $destination, ?RecoveryDatabase $database, ?string $schema, bool $resume, ?callable $summary = null, ?string $localMediaDryRunPrefix = null, ?callable $phaseListener = null): array
+    public function recover(array $manifest, array $receipt, $input, string $destination, ?RecoveryDatabase $database, ?string $schema, bool $resume, ?callable $summary = null, ?string $localMediaDryRunPrefix = null, ?callable $phaseListener = null, ?callable $progressListener = null): array
     {
         if ($resume && $database instanceof SqliteDatabaseClient) { throw new RuntimeException('SQLite recovery cannot be resumed; use a fresh destination.'); }
         $this->phaseListener = $phaseListener;
@@ -68,7 +68,7 @@ final class V4Restorer
             $backend = getenv('WRB_RECOVERY_METADATA_BACKEND');
             $plan = RecoveryMetadataMap::create($scan . '/metadata', $backend === false || $backend === '' ? 'auto' : $backend);
             $state['metadataBackend'] = $plan->backend(); $state['phase'] = 'prepare'; $this->saveState($workspace, $state);
-            $this->prepare($manifest, $identity, $scan, true, $plan);
+            $this->prepare($manifest, $identity, $scan, true, $plan, $progressListener);
             $mediaDryRun = $localMediaDryRunPrefix === null ? null : $this->mediaDryRun($localMediaDryRunPrefix, $plan);
             if ($summary !== null) {
                 $preview = $this->summary($manifest, true);
@@ -211,12 +211,13 @@ final class V4Restorer
         finally { flock($lock, LOCK_UN); fclose($lock); }
     }
 
-    private function prepare(array $manifest, $identity, string $scan, bool $payload = true, ?RecoveryMetadataMap $map = null): RecoveryMetadataMap
+    private function prepare(array $manifest, $identity, string $scan, bool $payload = true, ?RecoveryMetadataMap $map = null, ?callable $progress = null): RecoveryMetadataMap
     {
         $map = $map ?? RecoveryMetadataMap::create($scan . '/metadata', 'legacy');
         if (!mkdir($scan . '/packs', 0700)) { throw new RuntimeException('Cannot create v4 pack workspace.'); }
         $indexedPacks = $payload && $map->backend() !== 'legacy';
-        $scope = V4Format::scopeId($manifest['scope']); $packs = 0;
+        $scope = V4Format::scopeId($manifest['scope']); $packs = 0; $packTotal = $manifest['counts']['packs'];
+        if ($progress !== null && $packTotal > 0) { $progress(['unit' => 'packs', 'done' => 0, 'total' => $packTotal]); }
         foreach ($this->records($manifest, 'packs', $identity, $scan) as $pack) {
             $key = $pack['object']['key'];
             if (strpos($key, 'packs/' . $scope . '/') !== 0 || $map->get('pack:' . $key) !== null) { throw new RuntimeException('Repeated v4 pack or storage scope mismatch.'); }
@@ -239,6 +240,7 @@ final class V4Restorer
                     $retained = true;
                 } else { V4Pack::extract($tar, $scan . '/packs/' . hash('sha256', $key), $pack); }
             } finally { if (!$retained && @lstat($tar) !== false) { unlink($tar); } }
+            if ($progress !== null && $packs <= $packTotal) { $progress(['unit' => 'packs', 'done' => $packs, 'total' => $packTotal]); }
         }
         if ($packs !== $manifest['counts']['packs']) { throw new RuntimeException('V4 pack or content count differs from its root.'); }
         $roots = [];
@@ -246,7 +248,8 @@ final class V4Restorer
             $roots[$root['id']] = $root;
             $map->put('entry:roots/' . $root['name'], ['type' => 'directory', 'mode' => $root['type'] === 'directory' ? $root['mode'] : 0700]);
         }
-        $counts = ['files' => 0, 'directories' => 0, 'links' => 0, 'fileBytes' => 0]; $file = null;
+        $counts = ['files' => 0, 'directories' => 0, 'links' => 0, 'fileBytes' => 0]; $file = null; $fileTotal = $manifest['counts']['files'];
+        if ($progress !== null) { $progress($fileTotal > 0 ? ['unit' => 'files', 'done' => 0, 'total' => $fileTotal] : null); }
         foreach ($this->records($manifest, 'filesystem', $identity, $scan) as $record) {
             if ($record['type'] === 'part') {
                 if ($file === null) { throw new RuntimeException('V4 content part has no open file.'); }
@@ -259,6 +262,10 @@ final class V4Restorer
             if ($record['type'] === 'end') {
                 if ($file === null || $file['bytes'] !== $file['record']['size'] || ($payload && !hash_equals($record['sha256'], hash_final($file['hash'])))) { throw new RuntimeException('V4 file size or digest differs.'); }
                 $map->put('entry:' . $file['path'], $file['record'] + ['sha256' => $record['sha256']], true);
+                $verified = $counts['files'];
+                if ($progress !== null && $verified <= $fileTotal && ($verified % 128 === 0 || $verified === $fileTotal)) {
+                    $progress(['unit' => 'files', 'done' => $verified, 'total' => $fileTotal]);
+                }
                 $file = null; continue;
             }
             if ($file !== null) { throw new RuntimeException('V4 file is missing its end record.'); }
@@ -275,6 +282,7 @@ final class V4Restorer
             if ($root['type'] === 'file' && ($map->get('entry:roots/' . $root['name'] . '/' . basename($root['sourcePath']))['type'] ?? null) !== 'file') { throw new RuntimeException('V4 single-file source root has no saved file.'); }
         }
         foreach ($counts as $name => $value) { if ($manifest['counts'][$name] !== $value) { throw new RuntimeException('V4 filesystem count or byte total differs.'); } }
+        if ($progress !== null) { $progress(null); }
         foreach ($map->entries() as $key => $entry) {
             if (strpos($key, 'entry:') !== 0) { continue; }
             $path = substr($key, 6); $parent = dirname($path);

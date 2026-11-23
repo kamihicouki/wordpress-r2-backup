@@ -17,6 +17,7 @@ final class RestoreService
     private string $base;
     private string $library;
     private ?array $probe = null;
+    private ?bool $workerSignals = null;
 
     /**
      * @param array $env base, age, source (type repository|direct-r2-file|direct-r2), connections, protectedPaths, activeDatabase, viewerLocal, php
@@ -66,7 +67,7 @@ final class RestoreService
         foreach ($this->env['connections'] as $id => $set) {
             $connections[] = ['id' => $id, 'label' => $set['label'], 'socket' => $set['socket'], 'database' => $set['database'] ?? null, 'accountsRegistered' => isset($set['inspector'], $set['importer'], $set['runner'])];
         }
-        return ['scope' => self::SCOPE, 'connections' => $connections, 'startup' => $this->startupCapability(), 'latest' => $this->latestStatus(), 'suggestedName' => $this->suggestedName(), 'suggestedPort' => $this->suggestedPort()];
+        return ['scope' => self::SCOPE, 'connections' => $connections, 'sourceConfigured' => ($this->env['source']['type'] ?? 'unconfigured') !== 'unconfigured', 'startup' => $this->startupCapability(), 'latest' => $this->latestStatus(), 'suggestedName' => $this->suggestedName(), 'suggestedPort' => $this->suggestedPort()];
     }
 
     /** Short enough to type when confirming, and unused so the common case needs no thought. */
@@ -86,14 +87,20 @@ final class RestoreService
         return null;
     }
 
-    public function snapshots(): array
+    public function snapshots(array $secrets = []): array
     {
         try {
-            $records = $this->repository()->listStatus();
-        } catch (\Throwable $error) { throw new RestoreError('保存先の世代一覧を取得できません。保存先の設定を確認してください。'); }
+            $repository = $this->repository($secrets);
+            $records = $repository->listCandidates();
+        } catch (RestoreError $error) { throw $error; }
+        catch (\Throwable $error) { throw new RestoreError('バックアップ一覧を取得できません。復元情報ファイルと、サーバーから保存先へ接続できるかを確認してください。', 'r2Connection'); }
         $list = [];
-        foreach ($records as $record) { $list[] = ['snapshotId' => $record['snapshotId'], 'valid' => !empty($record['valid'])]; }
-        return array_reverse($list);
+        foreach ($records as $record) {
+            $list[] = ['snapshotId' => $record['snapshotId'], 'valid' => !empty($record['valid']), 'verified' => $record['verified'], 'savedAt' => $record['savedAt'] ?? null];
+        }
+        usort($list, static fn (array $left, array $right): int => strcmp($right['savedAt'] ?? '', $left['savedAt'] ?? '')
+            ?: strcmp($right['snapshotId'], $left['snapshotId']));
+        return $list;
     }
 
     public function preflight(array $input, array $secrets, string $actor): array
@@ -133,14 +140,20 @@ final class RestoreService
             if (!unlink($planFile)) { throw new RestoreError('確認を使用済みにできないため開始しません。'); }
             $job = $this->jobDirectory($plan['name']);
             if (!@mkdir($job, 0700)) { throw new RestoreError('この名前はすでに使われています。', 'name'); }
-            $source = $this->env['source']; unset($source['profile']);
+            $sqliteTemp = null;
+            if ($plan['database'] === 'sqlite') {
+                try { $sqliteTemp = FileSafety::createPrivateDirectory($job . '/sqlite-tmp'); }
+                catch (\RuntimeException $error) { throw new RestoreError('SQLite照合用の一時フォルダーを用意できません。復元先の権限と空き容量を確認し、新しい復元名を指定してください。'); }
+            }
+            $selected = $this->selectedSource($secrets);
+            $source = $selected; unset($source['profile']);
             $connection = null;
             if ($plan['database'] === 'mysql') { $connection = $this->env['connections'][$plan['mysql']['connection']]; unset($connection['inspector'], $connection['importer'], $connection['runner']); }
             $this->writeJson($job . '/job.json', ['plan' => $plan, 'root' => $review['facts']['root'], 'sourceUrl' => $review['facts']['sourceUrl'], 'source' => $source, 'age' => $this->env['age'], 'connection' => $connection, 'startupAvailable' => $this->startupCapability()['available']]);
-            $this->writeJson($job . '/status.json', ['name' => $plan['name'], 'state' => 'queued', 'phase' => 'queued', 'startedAt' => time(), 'updatedAt' => time(), 'results' => self::initialResults($plan)]);
+            $this->writeJson($job . '/status.json', ['name' => $plan['name'], 'state' => 'queued', 'phase' => 'queued', 'capturedAt' => $review['manifest']['capturedAt'], 'startedAt' => time(), 'updatedAt' => time(), 'results' => self::initialResults($plan)]);
             $this->writeBytes($this->base . '/latest', $plan['name']);
-            $frame = ['mode' => 'restore', 'identity' => $secrets['identity'], 'adminHash' => RestorePlan::portableHash((string) $secrets['adminPassword']), 'accounts' => $plan['database'] === 'mysql' ? $this->accounts($plan, $secrets) : null, 'profile' => $this->env['source']['profile'] ?? null];
-            $this->launch($plan['name'], $frame, 'worker.lock');
+            $frame = ['mode' => 'restore', 'identity' => $secrets['identity'], 'adminHash' => $plan['adminLogin'] === null ? null : RestorePlan::portableHash($secrets['adminPassword']), 'accounts' => $plan['database'] === 'mysql' ? $this->accounts($plan, $secrets) : null, 'profile' => $selected['profile'] ?? null];
+            $this->launch($plan['name'], $frame, 'worker.lock', $sqliteTemp);
             return $this->status($plan['name']);
         } finally { $this->release($lock); }
     }
@@ -153,17 +166,37 @@ final class RestoreService
         if (!is_file($job . '/status.json')) { throw new RestoreError('指定の復元が見つかりません。'); }
         $status = $this->readJson($job . '/status.json');
         if ($status === null) { throw new RestoreError('復元の状態を読み取れません。'); }
-        if (in_array($status['state'], ['queued', 'running'], true) && !$this->held($job . '/worker.lock') && (time() - ($status['startedAt'] ?? 0) > 20 || $status['state'] === 'running')) {
+        if (self::possiblyInterrupted($status)) { $status = $this->resolveWorkerStatus($job, $status); }
+        $status['site'] = $this->siteStatus($job, $status);
+        $status['phaseLabel'] = self::phaseLabel((string) ($status['phase'] ?? ''));
+        return $status;
+    }
+
+    private static function possiblyInterrupted(array $status): bool
+    {
+        return $status['state'] === 'running' || ($status['state'] === 'queued' && time() - ($status['startedAt'] ?? 0) > 20);
+    }
+
+    private function resolveWorkerStatus(string $job, array $observed): array
+    {
+        $path = $job . '/worker.lock';
+        FileSafety::assertNoLinks($path);
+        $lock = @fopen($path, 'c+b');
+        if ($lock === false) { throw new RestoreError('復元処理の状態を確認できません。'); }
+        try {
+            // A worker can publish its final state after the first read and before releasing its exclusive lock.
+            if (!flock($lock, LOCK_SH | LOCK_NB)) { return $observed; }
+            $status = $this->readJson($job . '/status.json');
+            if ($status === null) { throw new RestoreError('復元の状態を読み取れません。'); }
+            if (!self::possiblyInterrupted($status)) { return $status; }
             $requested = is_file($job . '/stop-requested');
             $this->removeCredentials($job);
             $current = self::failCurrent($status['results'] ?? []);
             $status = array_merge($status, ['state' => $requested ? 'stopped' : 'interrupted', 'results' => $current, 'updatedAt' => time(),
                 'message' => $requested ? '依頼により処理を停止しました。' : '処理が途中で終了しました。同じデータベースへは再取込しません。新しい名前と新しいデータベースでやり直してください。']);
             $this->writeJson($job . '/status.json', $status);
-        }
-        $status['site'] = $this->siteStatus($job, $status);
-        $status['phaseLabel'] = self::phaseLabel((string) ($status['phase'] ?? ''));
-        return $status;
+            return $status;
+        } finally { fclose($lock); }
     }
 
     public function stop(string $name): array
@@ -216,13 +249,15 @@ final class RestoreService
             if ($data['plan']['database'] !== 'sqlite') { throw new RestoreError('MySQL／MariaDBの起動用DBは再利用できません。新しい接続セットと復元名で最初から実行してください。'); }
             $prefix = is_string($input['tablePrefix'] ?? null) && trim($input['tablePrefix']) !== '' ? trim($input['tablePrefix']) : $data['plan']['tablePrefix'];
             if (!preg_match('/\A[A-Za-z0-9_]{1,64}\z/D', $prefix)) { throw new RestoreError('表の接頭辞は英数字と下線で指定してください。', 'tablePrefix'); }
-            if (!is_string($secrets['adminPassword'] ?? null) || strlen($secrets['adminPassword']) < 12) { throw new RestoreError('確認用ログインのパスワードを12文字以上で入力してください。', 'adminPassword'); }
+            $this->assertWorkerSignals();
+            $createAdmin = ($data['plan']['adminLogin'] ?? null) !== null;
+            if ($createAdmin && (!is_string($secrets['adminPassword'] ?? null) || strlen($secrets['adminPassword']) < 12)) { throw new RestoreError('確認用ログインのパスワードを12文字以上で入力してください。', 'adminPassword'); }
             $data['plan']['tablePrefix'] = $prefix;
             $this->writeJson($job . '/job.json', $data);
             $status = array_merge($this->readJson($job . '/status.json'), ['state' => 'queued', 'phase' => 'site-copy', 'startedAt' => time(), 'updatedAt' => time()]);
-            unset($status['message'], $status['startup']);
+            unset($status['message'], $status['startup'], $status['restoredUrls']);
             $this->writeJson($job . '/status.json', $status);
-            $this->launch($name, ['mode' => 'startup', 'adminHash' => RestorePlan::portableHash($secrets['adminPassword'])], 'worker.lock');
+            $this->launch($name, ['mode' => 'startup', 'adminHash' => $createAdmin ? RestorePlan::portableHash($secrets['adminPassword']) : null], 'worker.lock');
             return $this->status($name);
         } finally { $this->release($lock); }
     }
@@ -283,7 +318,7 @@ final class RestoreService
         else {
             try {
                 $stream = fopen('php://memory', 'w+b'); fwrite($stream, $identity); rewind($stream);
-                try { $manifest = (new Restorer(new AgeProcess($this->env['age']), $this->repository()))->describe($plan['snapshot'], $stream); }
+                try { $manifest = (new Restorer(new AgeProcess($this->env['age']), $this->repository($secrets)))->describe($plan['snapshot'], $stream); }
                 finally { fclose($stream); }
                 $add('key', '秘密鍵でバックアップを開けるか', 'ok');
             } catch (\Throwable $error) { $add('key', '秘密鍵でバックアップを開けるか', 'failed', '選んだバックアップを開けません。この保存先の秘密鍵か確認してください。', 'identity'); }
@@ -307,6 +342,8 @@ final class RestoreService
         else { $this->checkSqliteRuntime($add); }
         if ($manifest !== null && $root !== null) { $this->checkStartup($plan, $facts['sourceUrl'], $secrets, $add); }
         $this->checkPort($plan, $add);
+        try { $this->assertWorkerSignals(); }
+        catch (RestoreError $error) { $add('worker', '復元処理の起動', 'failed', $error->getMessage()); }
         $ok = true;
         foreach ($checks as $check) { if ($check['state'] === 'failed') { $ok = false; } }
         $review = ['ok' => $ok, 'checks' => $checks];
@@ -322,7 +359,7 @@ final class RestoreService
      */
     private function secretMac(array $plan, array $secrets, string $key): string
     {
-        $bound = ['identity' => $secrets['identity'] ?? null, 'adminPassword' => $secrets['adminPassword'] ?? null];
+        $bound = ['identity' => $secrets['identity'] ?? null, 'r2Connection' => $secrets['r2Connection'] ?? null, 'adminPassword' => $plan['adminLogin'] !== null ? ($secrets['adminPassword'] ?? null) : null];
         if ($plan['database'] === 'mysql') {
             $set = $this->env['connections'][$plan['mysql']['connection']];
             foreach (['inspector', 'importer', 'runner'] as $role) { $bound[$role] = $set[$role] ?? ['user' => $secrets[$role . 'User'] ?? null, 'password' => $secrets[$role . 'Password'] ?? null]; }
@@ -334,7 +371,8 @@ final class RestoreService
     {
         $summary = ['name' => $plan['name'], 'snapshot' => $plan['snapshot'], 'sourceUrl' => $facts['sourceUrl'], 'capturedAt' => $manifest['capturedAt'], 'counts' => ['files' => $manifest['counts']['files'], 'bytes' => $manifest['counts']['fileBytes'], 'tables' => $manifest['database']['tableCount']],
             'destination' => $job, 'purpose' => $plan['purpose'], 'database' => $plan['database'] === 'mysql' ? ['mode' => 'データベースサーバー（MySQL／MariaDB）', 'original' => $plan['mysql']['database'], 'running' => $plan['mysql']['runningDatabase'], 'connection' => $this->env['connections'][$plan['mysql']['connection']]['label']] : ['mode' => 'かんたん（SQLite）', 'original' => $job . '/original-db/site.sqlite', 'running' => $job . '/running-db/site.sqlite'],
-            'targetUrl' => $plan['targetUrl'], 'previewUrl' => $plan['previewUrl'], 'aliases' => $plan['aliases'], 'adminLogin' => $plan['adminLogin']];
+            'targetUrl' => $plan['targetUrl'], 'publicationUrls' => RestorePlan::publicationUrls($plan), 'urlMode' => RestorePlan::urlMode($plan),
+            'previewUrl' => $plan['previewUrl'], 'aliases' => $plan['aliases'], 'adminLogin' => $plan['adminLogin']];
         if (($manifest['consistency']['mode'] ?? null) === 'online') { $summary['consistency'] = $manifest['consistency']; }
         return $summary;
     }
@@ -344,7 +382,8 @@ final class RestoreService
         $free = @disk_free_space($this->base);
         if ($free === false) { $add('disk', '空き容量', 'warning', '空き容量を確認できません。'); return; }
         $files = (float) $manifest['counts']['fileBytes']; $database = (float) $manifest['database']['size'];
-        if ($plan['purpose'] === 'full' ? $free < ($files + $database) * 2 : $free < $database * 3) { $add('disk', '空き容量', 'failed', '保存先の空き容量が不足しています。'); return; }
+        $migration = ($plan['targetUrl'] !== null || $plan['adminLogin'] !== null) ? $database : 0;
+        if ($plan['purpose'] === 'full' ? $free < ($files + $database) * 2 + $migration : $free < $database * 3 + $migration) { $add('disk', '空き容量', 'failed', '保存先の空き容量が不足しています。'); return; }
         if ($plan['purpose'] !== 'full' && $free < ($files + $database) * 2) { $add('disk', '空き容量', 'warning', '空き容量に余裕がありません。メディア以外の容量は実行時に確定します。'); return; }
         $add('disk', '空き容量', 'ok');
     }
@@ -386,24 +425,25 @@ final class RestoreService
     private function checkStartup(array $plan, string $sourceUrl, array $secrets, callable $add): void
     {
         $password = $secrets['adminPassword'] ?? '';
-        if (!is_string($password) || strlen($password) < 12) { $add('startup', '確認用サイトの設定', 'failed', '確認用ログインのパスワードを12文字以上で決めてください。保存はしません。', 'adminPassword'); return; }
-        $administrator = ['login' => $plan['adminLogin'], 'passwordHash' => '$P$B' . str_repeat('.', 30)];
+        if ($plan['adminLogin'] !== null && (!is_string($password) || strlen($password) < 12)) { $add('startup', '確認用サイトの設定', 'failed', '確認用ログインのパスワードを12文字以上で決めてください。保存はしません。', 'adminPassword'); return; }
+        $administrator = $plan['adminLogin'] === null ? [] : ['login' => $plan['adminLogin'], 'passwordHash' => '$P$B' . str_repeat('.', 30)];
+        $target = $plan['targetUrl'] ?? $sourceUrl;
+        $aliases = $plan['targetUrl'] === null ? [] : $plan['aliases'];
         $job = $this->base . '/.check-' . bin2hex(random_bytes(8));
         try {
+            if ($plan['targetUrl'] !== null) { SiteUrlRewriter::replacements($sourceUrl, $target, $aliases); }
             mkdir($job, 0700);
             try {
                 if ($plan['database'] === 'sqlite') {
                     mkdir($job . '/running-db', 0700);
-                    (new SqliteSiteSetup($this->library . '/dependencies/sqlite-database-integration'))->preflight($job . '/site', $job . '/running-db/site.sqlite', $sourceUrl, $plan['previewUrl'], $plan['tablePrefix'], $administrator, $plan['aliases'], $job . '/restore', $job . '/original-db/site.sqlite', $plan['targetUrl']);
-                } else {
-                    SiteUrlRewriter::replacements($sourceUrl, $plan['targetUrl'] ?? $plan['previewUrl'], $plan['aliases']);
+                    (new SqliteSiteSetup($this->library . '/dependencies/sqlite-database-integration'))->preflight($job . '/site', $job . '/running-db/site.sqlite', $sourceUrl, $plan['previewUrl'], $plan['tablePrefix'], $administrator, $aliases, $job . '/restore', $job . '/original-db/site.sqlite', $target);
                 }
             } finally { @rmdir($job . '/running-db'); }
             $capability = $this->startupCapability();
             if (!$capability['available']) { $add('startup', '確認用サイトの起動', 'warning', $capability['reason'] . $capability['guidance']); return; }
             $socket = $plan['database'] === 'mysql' ? $this->env['connections'][$plan['mysql']['connection']]['socket'] : null;
-            LocalSiteServer::preflight($job . '/site', $socket === null ? $job . '/running-db/site.sqlite' : null, $plan['previewUrl'], $this->library . '/local-router.php', $socket, $this->phpBinary(), $plan['targetUrl']);
-            $add('startup', '確認用サイトの設定', 'ok', $plan['targetUrl'] === null ? 'サイトのアドレスを確認用アドレスへ書き換えます。' : 'サイトのアドレスを新しいアドレスへ書き換え、確認は確認用アドレスで行います。');
+            LocalSiteServer::preflight($job . '/site', $socket === null ? $job . '/running-db/site.sqlite' : null, $plan['previewUrl'], $this->library . '/local-router.php', $socket, $this->phpBinary(), $target);
+            $add('startup', '確認用サイトの設定', 'ok', '動作確認には、運用URLとは別の確認用URLを使います。');
         } catch (\Throwable $error) {
             $add('startup', '確認用サイトの設定', 'failed', 'アドレスの設定を受け付けられません。新しいアドレスが元のサイトのアドレスと重なっていないか確認してください。', 'targetUrl');
         } finally { @rmdir($job); }
@@ -474,9 +514,17 @@ final class RestoreService
         @unlink($record);
     }
 
-    private function repository()
+    private function selectedSource(array $secrets): array
     {
-        return self::openRepository($this->env['source']);
+        $body = $secrets['r2Connection'] ?? '';
+        if ($body === '') { return $this->env['source']; }
+        try { return ['type' => 'direct-r2', 'profile' => DirectR2Repository::connectionFromContents($body)]; }
+        catch (\Throwable $error) { throw new RestoreError('R2接続ファイルの形式を確認してください。', 'r2Connection'); }
+    }
+
+    private function repository(array $secrets = [])
+    {
+        return self::openRepository($this->selectedSource($secrets));
     }
 
     public static function openRepository(array $source)
@@ -493,12 +541,15 @@ final class RestoreService
         $plan = $data['plan'] ?? null;
         if ($plan === null) { return ['state' => 'none']; }
         $capability = $this->startupCapability();
-        $site = ['adminLogin' => $plan['adminLogin'], 'previewUrl' => $plan['previewUrl'], 'targetUrl' => $plan['targetUrl'], 'state' => 'not-started', 'reason' => '', 'guidance' => '', 'openable' => false, 'response' => 'not-checked'];
+        $site = ['adminLogin' => $plan['adminLogin'], 'previewUrl' => $plan['previewUrl'], 'targetUrl' => $plan['targetUrl'], 'state' => 'not-started', 'reason' => '', 'guidance' => '', 'openable' => false, 'adminOpenable' => false, 'response' => 'not-checked'];
+        $site['publication'] = RestorePlan::publicationUrls($plan) + ['mode' => RestorePlan::urlMode($plan), 'recordedHome' => $data['sourceUrl'] ?? null];
         if (!$capability['available']) { return array_merge($site, ['state' => 'unavailable', 'reason' => $capability['reason'], 'guidance' => $capability['guidance']]); }
         $state = is_file($job . '/site-state.json') ? $this->readJson($job . '/site-state.json') : null;
         if ($this->held($job . '/site.lock')) {
             $site['state'] = 'running';
-            $site['response'] = $this->probeSite($plan['previewUrl']);
+            $probe = $this->probeSite($plan['previewUrl'], $this->env['viewerLocal'] === true);
+            $site['response'] = $probe['response'];
+            $site['adminOpenable'] = $probe['adminOpenable'];
         } elseif (is_array($state)) {
             $site['state'] = ($state['state'] ?? '') === 'starting' && time() - ($state['updatedAt'] ?? 0) < 15 ? 'starting' : (($state['state'] ?? '') === 'failed' ? 'failed' : 'stopped');
             if ($site['state'] === 'failed') { $site['reason'] = '確認用サイトを起動できませんでした。ポート番号を確認してください。'; }
@@ -512,7 +563,7 @@ final class RestoreService
     }
 
     /** A fixed request to this machine's own listener; the address comes from the validated plan, never from a request. */
-    private function probeSite(string $previewUrl): string
+    private function probeSite(string $previewUrl, bool $checkAdmin): array
     {
         $parts = parse_url($previewUrl);
         $read = static function (string $path) use ($parts): ?string {
@@ -524,9 +575,20 @@ final class RestoreService
             return is_string($response) ? $response : null;
         };
         $isolation = $read('/__wrb_isolation_check');
-        if ($isolation === null || strpos($isolation, '"localOnly":true') === false) { return 'not-responding'; }
-        $home = $read('/');
-        return $home !== null && preg_match('~\AHTTP/1\.[01] [123]~', $home) === 1 ? 'responding' : 'error';
+        $result = ['response' => 'not-responding', 'adminOpenable' => false];
+        if ($isolation === null || strpos($isolation, '"localOnly":true') === false) { return $result; }
+        $ok = static fn (?string $response): bool => $response !== null && preg_match('~\AHTTP/1\.[01] 2[0-9]{2} ~', $response) === 1;
+        if (!$ok($read('/'))) { $result['response'] = 'error'; return $result; }
+        $result['response'] = 'responding';
+        if (!$checkAdmin) { return $result; }
+        $admin = $read('/wp-admin/');
+        if ($ok($admin)) { $result['adminOpenable'] = true; }
+        elseif ($admin !== null && preg_match('~\AHTTP/1\.[01] 30[12378] ~', $admin) === 1
+            && preg_match('~^Location: ([^\r\n]+)~mi', explode("\r\n\r\n", $admin, 2)[0], $match) === 1
+            && preg_match('~\A(?:' . preg_quote($previewUrl, '~') . ')?/wp-login\.php(?:[?#]|\z)~', trim($match[1])) === 1) {
+            $result['adminOpenable'] = $ok($read('/wp-login.php'));
+        }
+        return $result;
     }
 
     private function latestStatus(): array
@@ -567,13 +629,17 @@ final class RestoreService
     }
 
     /** The worker is detached before it receives anything, so a slow restore holds no web request. Secrets go only through its stdin. */
-    private function launch(string $name, array $frame, string $lockName): void
+    private function launch(string $name, array $frame, string $lockName, ?string $sqliteTemp = null): void
     {
         $job = $this->jobDirectory($name); $php = $this->phpBinary();
         $body = json_encode($frame, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
-        $command = 'exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; ' . escapeshellarg($php) . ' ' . escapeshellarg($this->library . '/restore-worker.php') . ' ' . escapeshellarg($this->base) . ' ' . escapeshellarg($name) . ' <&0 >/dev/null 2>&1 & echo $!';
+        // POSIX shells may replace an asynchronous command's fd 0 with /dev/null before applying redirections.
+        // Save the input pipe first, then restore it for the worker and close the duplicate there.
+        $command = 'exec 3<&0 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; ' . escapeshellarg($php) . ' ' . escapeshellarg($this->library . '/restore-worker.php') . ' ' . escapeshellarg($this->base) . ' ' . escapeshellarg($name) . ' <&3 3<&- >/dev/null 2>&1 & echo $!';
         $environment = ['PATH' => '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG' => 'C.UTF-8'];
         foreach (['HOME', 'TMPDIR'] as $variable) { $value = getenv($variable); if (is_string($value) && $value !== '') { $environment[$variable] = $value; } }
+        // Some SQLite builds select the temporary directory before the PHP script starts.
+        if ($sqliteTemp !== null) { $environment['SQLITE_TMPDIR'] = $sqliteTemp; }
         if (!isset($environment['HOME']) && function_exists('posix_getpwuid') && function_exists('posix_geteuid')) { $environment['HOME'] = (string) (posix_getpwuid(posix_geteuid())['dir'] ?? ''); }
         $process = @proc_open(['/bin/sh', '-c', $command], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, $job, $environment);
         if (!is_resource($process)) { $this->launchFailed($job); throw new RestoreError('バックグラウンド処理を起動できません。'); }
@@ -588,13 +654,13 @@ final class RestoreService
             if ($count === 0) { usleep(5000); }
         }
         fclose($pipes[0]); $body = ''; proc_close($process);
-        if (!$sent || !preg_match('/\A[1-9][0-9]*\z/D', $pid) || !$this->waitFor(function () use ($job, $lockName): bool { return $this->held($job . '/' . $lockName) || $this->workerAnswered($job, $lockName); }, 10)) {
+        if (!$sent || !preg_match('/\A[1-9][0-9]*\z/D', $pid) || !$this->waitFor(function () use ($job, $lockName): bool { return $this->workerAnswered($job, $lockName); }, 10)) {
             $this->launchFailed($job);
             throw new RestoreError('バックグラウンド処理を開始できません。PHP CLIの設定を確認してください。');
         }
     }
 
-    /** A worker quick enough to have finished has released its lock; what it wrote still proves it ran. */
+    /** Acquiring a lock alone does not acknowledge startup. The worker must write its first state. */
     private function workerAnswered(string $job, string $lockName): bool
     {
         if ($lockName === 'site.lock') { return ($this->readJson($job . '/site-state.json')['state'] ?? 'starting') !== 'starting'; }
@@ -610,6 +676,18 @@ final class RestoreService
     private function phpBinary(): string
     {
         return is_string($this->env['php']) && $this->env['php'] !== '' ? $this->env['php'] : LiveRunner::phpBinary();
+    }
+
+    private function assertWorkerSignals(): void
+    {
+        if ($this->workerSignals === null) {
+            $code = 'exit(function_exists("pcntl_async_signals") && function_exists("pcntl_signal") ? 0 : 1);';
+            $process = @proc_open([$this->phpBinary(), '-r', $code], [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
+            $this->workerSignals = is_resource($process) && proc_close($process) === 0;
+        }
+        if (!$this->workerSignals) {
+            throw new RestoreError('復元に使うPHP CLIでシグナル拡張（pcntl）が有効になっていません。復元サーバー側で有効にしてください。');
+        }
     }
 
     /** The web process's own extensions do not tell what the CLI has, nor what the isolated server keeps with no ini file. */

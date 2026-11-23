@@ -17,7 +17,7 @@ final class RestoreApi
             $name = is_string($post['job'] ?? null) ? $post['job'] : '';
             switch ($command) {
                 case 'context': return [200, $service->context()];
-                case 'snapshots': return [200, ['snapshots' => $service->snapshots()]];
+                case 'snapshots': return [200, ['snapshots' => $service->snapshots($secrets)]];
                 case 'preflight': return [200, $service->preflight($input, $secrets, $actor)];
                 case 'start': return [200, $service->start($input, $secrets, is_string($post['planHash'] ?? null) ? $post['planHash'] : '', is_string($post['confirmName'] ?? null) ? trim($post['confirmName']) : '', $actor)];
                 case 'status': return [200, $service->status($name === '' ? null : $name)];

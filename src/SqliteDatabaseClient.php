@@ -192,7 +192,6 @@ final class SqliteDatabaseClient implements RecoveryDatabase
                 }
                 $statement->closeCursor();
                 if ($count !== $table['rows'] || !hash_equals($table['rowSha256'], hash_final($digest))) { throw new RuntimeException('SQLite restored values differ from the selected generation.'); }
-                $this->progress(['phase' => 'sqlite-verification', 'tables' => count($names), 'rows' => $count]);
                 foreach ($table['foreignKeys'] as $foreignKey) {
                     $equal = []; $present = [];
                     foreach ($foreignKey['columns'] as $position => $column) {
@@ -203,6 +202,7 @@ final class SqliteDatabaseClient implements RecoveryDatabase
                         . ' WHERE ' . implode(' AND ', $present) . ' AND p.' . self::identifier($foreignKey['referencedColumns'][0]) . ' IS NULL';
                     if ((string) $this->database->query($query)->fetchColumn() !== '0') { throw new RuntimeException('SQLite restored references differ.'); }
                 }
+                $this->progress(['phase' => 'sqlite-verification', 'tables' => count($names), 'totalTables' => count($this->definitions), 'rows' => $count]);
             }
             $expected = array_keys($names); sort($expected); $actual = $this->tables(); sort($actual);
             if ($expected === [] || $expected !== $actual) { throw new RuntimeException('SQLite restored table inventory differs.'); }

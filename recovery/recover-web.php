@@ -18,7 +18,7 @@ wrbWebServe($wrbAutoload);
 
 function wrbWebCli(array $argv, string $autoload): int
 {
-    $usage = "php recover-web.php start --state-dir <0700> --port <n> --age <binary> (--repository <dir> --unit <64-hex> | --direct-r2-connection-file <0600>) [--mysql-connections <0600>]\n"
+    $usage = "php recover-web.php start --state-dir <0700> --port <n> --age <binary> [--repository <dir> --unit <64-hex> | --direct-r2-connection-file <0600>] [--mysql-connections <0600>]\n"
         . "php recover-web.php issue|stop-job|stop-site --state-dir <0700> [--job <name>]\n";
     array_shift($argv);
     $command = array_shift($argv);
@@ -44,9 +44,9 @@ function wrbWebCli(array $argv, string $autoload): int
         }
         foreach (['--port', '--age'] as $required) { if (!isset($options[$required])) { fwrite(STDERR, $usage); return 2; } }
         if (!preg_match('/\A[1-9][0-9]{3,4}\z/D', $options['--port']) || (int) $options['--port'] < 1024 || (int) $options['--port'] > 65535) { throw new RestoreError('ポートは1024〜65535で指定してください。'); }
-        if (isset($options['--repository']) === isset($options['--direct-r2-connection-file'])) { throw new RestoreError('保存先は --repository か --direct-r2-connection-file のどちらか一つを指定してください。'); }
-        $source = isset($options['--repository']) ? ['type' => 'repository', 'path' => $options['--repository'], 'unit' => $options['--unit'] ?? ''] : ['type' => 'direct-r2-file', 'path' => $options['--direct-r2-connection-file']];
-        RestoreService::openRepository($source);
+        if (isset($options['--repository'], $options['--direct-r2-connection-file'])) { throw new RestoreError('保存先は一つだけ指定してください。'); }
+        $source = isset($options['--repository']) ? ['type' => 'repository', 'path' => $options['--repository'], 'unit' => $options['--unit'] ?? ''] : (isset($options['--direct-r2-connection-file']) ? ['type' => 'direct-r2-file', 'path' => $options['--direct-r2-connection-file']] : ['type' => 'unconfigured']);
+        if ($source['type'] !== 'unconfigured') { RestoreService::openRepository($source); }
         RestoreService::loadConnections($options['--mysql-connections'] ?? null);
         $age = realpath($options['--age']);
         if ($age === false || !is_executable($age)) { throw new RestoreError('ageの実行ファイルを確認できません。'); }
@@ -111,13 +111,13 @@ function wrbWebServe(string $autoload): void
     $cookie = is_string($_COOKIE['wrb_recovery_session'] ?? null) ? $_COOKIE['wrb_recovery_session'] : '';
     if ($method === 'POST' && $path === '/activate') {
         $session = $auth->activate(is_string($_POST['code'] ?? null) ? trim($_POST['code']) : '');
-        if ($session === null) { wrbWebPage(401, wrbWebActivation('コードを確認できません。期限切れ・使用済み・失敗上限の場合は端末で issue を実行してください。')); return; }
+        if ($session === null) { wrbWebPage(401, wrbWebActivation('有効化できませんでした。入力を確認してください。コードの期限が切れた場合や使用済みの場合は、下の手順で再発行してください。')); return; }
         wrbWebRespond(303, 'text/plain; charset=utf-8', '', ['Location: /', 'Set-Cookie: wrb_recovery_session=' . $session . '; Path=/; HttpOnly; SameSite=Strict']);
         return;
     }
     $session = $auth->session($cookie);
     if ($method === 'GET' && $path === '/') {
-        if ($session === null) { wrbWebPage(200, wrbWebActivation('')); return; }
+        if ($session === null) { wrbWebPage(200, wrbWebActivation()); return; }
         wrbWebPage(200, RestorePage::render(['endpoint' => '/api', 'tokenName' => 'csrf', 'token' => $session['csrf'], 'reauth' => false, 'prefix' => 'wp_']));
         return;
     }
@@ -146,11 +146,21 @@ function wrbWebServe(string $autoload): void
     wrbWebRespond(404, 'text/plain; charset=utf-8', '見つかりません。');
 }
 
-function wrbWebActivation(string $error): string
+function wrbWebActivation(string $error = ''): string
 {
-    return '<div class="wrb-restore"><h1>独立復元画面の有効化</h1><p class="wrb-r-scope">この画面は初期状態では操作できません。起動した端末に表示された有効化コードを入力してください。</p>'
-        . ($error !== '' ? '<p class="wrb-r-note wrb-r-bad" role="alert">' . htmlspecialchars($error, ENT_QUOTES, 'UTF-8') . '</p>' : '')
-        . '<form method="post" action="/activate"><p class="wrb-r-field"><label for="wrb-code">有効化コード</label><input id="wrb-code" name="code" type="password" autocomplete="off" required></p><button class="wrb-r-button wrb-r-primary" type="submit">有効化</button></form></div>';
+    $escape = static function (string $value): string { return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
+    $command = 'php recover-web.php issue --state-dir <起動時に指定した状態フォルダー>';
+    $minutes = (int) (RestoreWebAuth::TOKEN_LIFETIME / 60);
+    return '<div class="wrb-restore"><h1>独立復元画面の有効化</h1>'
+        . ($error !== '' ? '<p class="wrb-r-note wrb-r-bad" role="alert">' . $escape($error) . '</p>' : '')
+        . '<form method="post" action="/activate"><p class="wrb-r-field"><label for="wrb-code">有効化コード</label>'
+        . '<span id="wrb-code-help" class="wrb-r-help">サーバーの起動時または再発行時に表示されたコードを入力してください。発行から' . $minutes . '分間、1回限り使えます。</span>'
+        . '<input id="wrb-code" name="code" type="password" autocomplete="off" aria-describedby="wrb-code-help" required></p><button class="wrb-r-button wrb-r-primary" type="submit">有効化</button></form>'
+        . '<section aria-labelledby="wrb-code-location"><h2 id="wrb-code-location">コードの確認・再発行（サーバー管理者向け）</h2>'
+        . '<p>復元サービスを起動した端末の「有効化コード」を確認します。起動出力をファイルに保存する構成では、管理者がサーバー上で指定した非公開ログを開いてください。</p>'
+        . '<p>状態フォルダーの <code>web/token.json</code> には認証用の照合値だけがあり、入力できるコードは取り出せません。</p>'
+        . '<p>コードが見つからない場合は、復元サービスを動かしているサーバーまたはコンテナで、状態フォルダーの所有者として復旧キットのあるフォルダーから次を実行してください。</p>'
+        . '<pre><code>' . $escape($command) . '</code></pre><p>端末に表示された新しいコードを入力してください。</p></section></div>';
 }
 
 function wrbWebPage(int $code, string $content): void

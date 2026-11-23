@@ -55,10 +55,11 @@ final class RestoreWebTest extends TestCase
         return [proc_close($process), $out, $error];
     }
 
-    private function boot(?string $age = null): void
+    private function boot(?string $age = null, bool $withoutSource = false): void
     {
         $this->state = Fixture::temp(); $this->port = RestoreTestBed::freePort();
-        $command = [PHP_BINARY, $this->script(), 'start', '--state-dir', $this->state, '--port', (string) $this->port, '--age', $age ?? Fixture::runtime()['age'], '--repository', self::$bed->repository, '--unit', self::$bed->unit];
+        $command = [PHP_BINARY, $this->script(), 'start', '--state-dir', $this->state, '--port', (string) $this->port, '--age', $age ?? Fixture::runtime()['age']];
+        if (!$withoutSource) { array_push($command, '--repository', self::$bed->repository, '--unit', self::$bed->unit); }
         $this->process = proc_open($command, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $this->pipes);
         stream_set_blocking($this->pipes[1], true);
         $deadline = microtime(true) + 10; $output = '';
@@ -71,6 +72,16 @@ final class RestoreWebTest extends TestCase
             usleep(50000);
         } while (microtime(true) < $deadline);
         self::fail('The independent server did not start.');
+    }
+
+    public function testUnconfiguredScreenAcceptsNoUntrustedEndpointOrOversizedSecret(): void
+    {
+        $this->boot(null, true); $this->signIn();
+        [$code, $result] = $this->api('snapshots', ['r2Connection' => '{"endpoint":"http://127.0.0.1"}']);
+        self::assertSame(400, $code); self::assertArrayHasKey('error', $result);
+        [$code, $result] = $this->api('snapshots', ['r2Connection' => str_repeat('x', 8193)]);
+        self::assertSame(400, $code); self::assertSame('r2Connection', $result['field']);
+        self::assertStringNotContainsString('127.0.0.1', (string) file_get_contents($this->state . '/web/config.json'));
     }
 
     private function origin(): array { return ['Origin' => 'http://127.0.0.1:' . $this->port]; }
@@ -108,7 +119,11 @@ final class RestoreWebTest extends TestCase
         $this->boot();
         [$code, , $page] = RestoreTestBed::http($this->port, 'GET', '/');
         self::assertSame(200, $code); self::assertStringContainsString('有効化コード', $page); self::assertStringNotContainsString('wrb-r-form', $page);
+        self::assertStringContainsString('php recover-web.php issue --state-dir &lt;起動時に指定した状態フォルダー&gt;', $page);
+        self::assertStringNotContainsString($this->state, $page);
         self::assertStringNotContainsString($this->code, $page);
+        [$code] = RestoreTestBed::http($this->port, 'GET', '/web/token.json');
+        self::assertSame(404, $code, 'Private activation records are never served by HTTP');
         [$code] = $this->api('status');
         self::assertSame(401, $code, 'The API is closed before activation');
         foreach (range(1, 5) as $ignored) { [$code] = $this->activate(str_repeat('0', 64)); self::assertSame(401, $code); }
