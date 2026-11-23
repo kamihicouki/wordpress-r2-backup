@@ -5,6 +5,7 @@ declare(strict_types=1);
 if (PHP_SAPI !== 'cli') { http_response_code(403); exit; }
 umask(0077);
 ini_set('display_errors', '0'); ini_set('log_errors', '0');
+ini_set('zend.exception_ignore_args', '1');
 set_error_handler(static function (int $severity, string $message): bool {
     if (!(error_reporting() & $severity)) { return false; }
     throw new ErrorException('A filesystem or runtime operation failed.', 0, $severity);

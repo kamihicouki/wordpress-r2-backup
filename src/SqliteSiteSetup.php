@@ -29,7 +29,9 @@ final class SqliteSiteSetup
         if (!preg_match('/\A[A-Za-z0-9_]{1,64}\z/D', $tablePrefix)) { throw new RuntimeException('Invalid WordPress table prefix.'); }
         SiteUrlRewriter::assertUrl($sourceUrl, false); SiteUrlRewriter::assertUrl($localUrl, true);
         if ($targetUrl !== null) { SiteUrlRewriter::assertUrl($targetUrl, false); }
-        SiteUrlRewriter::replacements(rtrim($sourceUrl, '/'), rtrim($targetUrl ?? $localUrl, '/'), $sourceAliases);
+        if (rtrim($sourceUrl, '/') !== rtrim($targetUrl ?? $localUrl, '/') || $sourceAliases !== []) {
+            SiteUrlRewriter::replacements(rtrim($sourceUrl, '/'), rtrim($targetUrl ?? $localUrl, '/'), $sourceAliases);
+        }
         SiteUrlRewriter::assertAdministrator($administrator);
         FileSafety::assertNoLinks($newSiteRoot); FileSafety::assertNoLinks($newDatabaseFile);
         FileSafety::privateDirectory(dirname($newSiteRoot)); FileSafety::privateDirectory(dirname($newDatabaseFile));
@@ -43,13 +45,14 @@ final class SqliteSiteSetup
         }
     }
 
-    public function prepare(string $sourceWordPressRoot, string $newSiteRoot, string $sourceSqliteFile, string $newDatabaseFile, string $sourceUrl, string $localUrl, string $tablePrefix, array $administrator = [], array $sourceAliases = [], ?string $targetUrl = null): array
+    public function prepare(string $sourceWordPressRoot, string $newSiteRoot, string $sourceSqliteFile, string $newDatabaseFile, string $sourceUrl, string $localUrl, string $tablePrefix, array $administrator = [], array $sourceAliases = [], ?string $targetUrl = null, ?string $migrationDatabase = null): array
     {
         if (!preg_match('/\A[A-Za-z0-9_]{1,64}\z/D', $tablePrefix)) { throw new RuntimeException('Invalid WordPress table prefix.'); }
         SiteUrlRewriter::assertUrl($sourceUrl, false); SiteUrlRewriter::assertUrl($localUrl, true);
         if ($targetUrl !== null) { SiteUrlRewriter::assertUrl($targetUrl, false); $targetUrl = rtrim($targetUrl, '/'); }
         $sourceUrl = rtrim($sourceUrl, '/'); $localUrl = rtrim($localUrl, '/'); $storedUrl = $targetUrl ?? $localUrl;
-        $replacements = SiteUrlRewriter::replacements($sourceUrl, $storedUrl, $sourceAliases);
+        $preserveUrls = $sourceUrl === $storedUrl && $sourceAliases === [];
+        $replacements = $preserveUrls ? [] : SiteUrlRewriter::replacements($sourceUrl, $storedUrl, $sourceAliases);
         FileSafety::assertNoLinks($sourceWordPressRoot); FileSafety::assertNoLinks($newSiteRoot);
         if (realpath($sourceWordPressRoot) !== $sourceWordPressRoot || !is_dir($sourceWordPressRoot)) { throw new RuntimeException('The restored source must be canonical.'); }
         foreach (['wp-load.php', 'wp-settings.php', 'wp-includes/version.php'] as $file) { FileSafety::assertRegularFile($sourceWordPressRoot . '/' . $file); }
@@ -70,9 +73,16 @@ final class SqliteSiteSetup
         $db = new \WP_MySQL_On_SQLite('mysql-on-sqlite:path=' . str_replace(';', ';;', $newDatabaseFile) . ';dbname=sqlite');
         $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $rewriter = new SiteUrlRewriter();
-        $updated = $rewriter->rewrite($db, $db, $replacements);
-        $rewriter->setOption($db, $tablePrefix . 'options', 'home', $storedUrl);
-        $rewriter->setOption($db, $tablePrefix . 'options', 'siteurl', $storedUrl);
+        $updated = 0;
+        if (!$preserveUrls) {
+            $updated = $rewriter->rewrite($db, $db, $replacements);
+            $rewriter->setOption($db, $tablePrefix . 'options', 'home', $storedUrl);
+            $rewriter->setOption($db, $tablePrefix . 'options', 'siteurl', $storedUrl);
+        }
+        if ($migrationDatabase !== null) {
+            FileSafety::privateDirectory(dirname($migrationDatabase));
+            $this->copyDatabase($newDatabaseFile, $migrationDatabase);
+        }
         if ($administrator !== []) { $rewriter->createAdministrator($db, $tablePrefix, $administrator); }
         $db = null;
         $this->storageProtection(dirname($newDatabaseFile), false);

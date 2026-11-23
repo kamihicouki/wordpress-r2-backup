@@ -27,7 +27,7 @@ final class RestoreTestBed
         return getenv('WRB_RUN_V4_MYSQL_INTEGRATION') === '1' && extension_loaded('mysqli') && extension_loaded('pdo_sqlite') && extension_loaded('pdo_mysql');
     }
 
-    public static function build(string $engine = 'mysql', ?string $siteUrlOption = null): self
+    public static function build(string $engine = 'mysql', ?string $siteUrlOption = null, ?string $recordedUrl = null): self
     {
         $bed = new self();
         // A MariaDB source cannot list its events while the scheduler is disabled; a restore target must have it disabled.
@@ -51,7 +51,7 @@ INSERT INTO wp_users(ID,user_login,user_pass,user_nicename,user_email,user_url,u
         $base = Fixture::temp();
         $site = $base . '/source-site'; mkdir($site, 0700);
         foreach (self::siteFiles() as $path => $bytes) { Fixture::write($site, $path, $bytes); chmod($site . '/' . $path, 0640); }
-        $bed->capture($source, $site, $url, $base);
+        $bed->capture($source, $site, $recordedUrl ?? $url, $base);
         $connection->close();
         if ($engine !== 'mysql') { $bed->server->stop(); $bed->server = IsolatedMysql::start(null, 'DISABLED', $engine); }
         return $bed;
@@ -89,7 +89,7 @@ INSERT INTO wp_users(ID,user_login,user_pass,user_nicename,user_email,user_url,u
         $tag = bin2hex(random_bytes(4));
         $schema = 'wrb_test_' . $tag;
         $engine = $server->engine();
-        $bin = $engine === 'mysql' ? IsolatedMysql::mysqlBin() : IsolatedMysql::mariadb105Bin();
+        $bin = $engine === 'mysql' ? IsolatedMysql::mysqlBin() : ($engine === 'mariadb105' ? IsolatedMysql::mariadb105Bin() : IsolatedMysql::mariadbBin());
         foreach ([$schema, $schema . '_run'] as $name) { $server->query('', 'CREATE DATABASE `' . $name . '` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'); }
         $importer = ['user' => 'wrb_imp_' . $tag, 'password' => 'importer-password-MARK2-' . $tag];
         $runner = ['user' => 'wrb_run_' . $tag, 'password' => 'runner-password-MARK3-' . $tag];
@@ -112,7 +112,7 @@ INSERT INTO wp_users(ID,user_login,user_pass,user_nicename,user_email,user_url,u
 
     public function input(string $name, int $port, array $changes = []): array
     {
-        return $changes + ['snapshot' => $this->snapshot, 'name' => $name, 'purpose' => 'startup-check', 'database' => 'sqlite', 'targetUrl' => self::TARGET_URL, 'previewPort' => (string) $port, 'tablePrefix' => 'wp_', 'adminLogin' => 'restore-admin'];
+        return $changes + ['snapshot' => $this->snapshot, 'name' => $name, 'purpose' => 'startup-check', 'database' => 'sqlite', 'targetUrl' => self::TARGET_URL, 'previewPort' => (string) $port, 'tablePrefix' => 'wp_', 'createPreviewAdmin' => '1', 'adminLogin' => 'restore-admin'];
     }
 
     public function secrets(array $changes = []): array

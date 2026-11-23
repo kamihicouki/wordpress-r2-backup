@@ -6,8 +6,8 @@ namespace WordPressR2Backup;
 /** Validates the restore form into one canonical request. Paths are never accepted from a browser; the service derives them from the name. */
 final class RestorePlan
 {
-    public const TEXT_FIELDS = ['snapshot' => 64, 'name' => 40, 'purpose' => 16, 'database' => 8, 'connection' => 32, 'mysqlDatabase' => 64, 'targetUrl' => 2048, 'aliases' => 16384, 'previewPort' => 5, 'tablePrefix' => 64, 'adminLogin' => 60, 'root' => 5];
-    public const SECRET_FIELDS = ['identity' => 65536, 'adminPassword' => 4096, 'inspectorUser' => 80, 'inspectorPassword' => 512, 'importerUser' => 80, 'importerPassword' => 512, 'runnerUser' => 80, 'runnerPassword' => 512];
+    public const TEXT_FIELDS = ['snapshot' => 64, 'name' => 40, 'purpose' => 16, 'database' => 8, 'connection' => 32, 'mysqlDatabase' => 64, 'urlMode' => 8, 'targetUrl' => 2048, 'targetSiteUrl' => 2048, 'aliases' => 16384, 'previewPort' => 5, 'tablePrefix' => 64, 'createPreviewAdmin' => 1, 'adminLogin' => 60, 'root' => 5];
+    public const SECRET_FIELDS = ['identity' => 65536, 'r2Connection' => 8192, 'adminPassword' => 4096, 'inspectorUser' => 80, 'inspectorPassword' => 512, 'importerUser' => 80, 'importerPassword' => 512, 'runnerUser' => 80, 'runnerPassword' => 512];
 
     /** @param array<string,array> $connections registered connection sets by id */
     public static function normalize(array $input, array $connections): array
@@ -32,13 +32,26 @@ final class RestorePlan
         $port = $text('previewPort');
         if (!preg_match('/\A[1-9][0-9]{3,4}\z/D', $port) || (int) $port < 1024 || (int) $port > 65535) { throw new RestoreError('確認用のポート番号は1024〜65535で指定してください。', 'previewPort'); }
         $plan['previewUrl'] = 'http://127.0.0.1:' . $port;
-        $target = rtrim($text('targetUrl'), '/');
-        if ($target !== '') {
-            try { SiteUrlRewriter::assertUrl($target, false); } catch (\RuntimeException $ignored) { throw new RestoreError('新しいアドレスは https://example.com の形で入力してください。', 'targetUrl'); }
+        $mode = $text('urlMode');
+        if ($mode === '') { $mode = $text('targetUrl') === '' ? 'keep' : 'database'; }
+        if (!in_array($mode, ['keep', 'database', 'config'], true)) { throw new RestoreError('運用URLの扱いを選んでください。', 'urlMode'); }
+        $plan['urlMode'] = $mode;
+        // targetUrl is the legacy worker's permission to rewrite a DB. Never populate it for config guidance.
+        $plan['targetUrl'] = $plan['configHome'] = $plan['targetSiteUrl'] = null;
+        if ($mode !== 'keep') {
+            $home = self::targetUrl($text('targetUrl'), 'targetUrl');
+            $site = $text('targetSiteUrl') === '' ? $home : self::targetUrl($text('targetSiteUrl'), 'targetSiteUrl');
+            if (self::origin($home) !== self::origin($site)) { throw new RestoreError('2つのURLの方式（HTTP／HTTPS）、ホスト名、ポートをそろえてください。', 'targetSiteUrl'); }
+            $homePath = (string) parse_url($home, PHP_URL_PATH); $sitePath = (string) parse_url($site, PHP_URL_PATH);
+            if ($sitePath !== $homePath) {
+                if ($mode === 'database') { throw new RestoreError('データベースへの反映ではWordPress本体の配置を変えられません。別の場所に配置する場合は「wp-config.php に記入する値を確認」を選んでください。', 'targetSiteUrl'); }
+                if (strpos($sitePath, $homePath . '/') !== 0) { throw new RestoreError('WordPress アドレス (URL) はサイトアドレス (URL) と同じか、その配下にしてください。', 'targetSiteUrl'); }
+            }
+            $plan[$mode === 'database' ? 'targetUrl' : 'configHome'] = $home;
+            $plan['targetSiteUrl'] = $site;
         }
-        $plan['targetUrl'] = $target === '' ? null : $target;
         $aliases = [];
-        foreach (preg_split('/\R/', $text('aliases')) ?: [] as $alias) {
+        foreach ($mode === 'database' ? (preg_split('/\R/', $text('aliases')) ?: []) : [] as $alias) {
             $alias = rtrim(trim($alias), '/');
             if ($alias === '') { continue; }
             try { SiteUrlRewriter::assertUrl($alias, false); } catch (\RuntimeException $ignored) { throw new RestoreError('別のアドレスは1行に1つ、https://example.com の形で入力してください。', 'aliases'); }
@@ -49,13 +62,55 @@ final class RestorePlan
         $prefix = $text('tablePrefix') === '' ? 'wp_' : $text('tablePrefix');
         if (!preg_match('/\A[A-Za-z0-9_]{1,64}\z/D', $prefix)) { throw new RestoreError('表の接頭辞は英数字と下線で指定してください。', 'tablePrefix'); }
         $plan['tablePrefix'] = $prefix;
-        $login = $text('adminLogin');
-        if (!preg_match('/\A[A-Za-z0-9_.-]{1,60}\z/D', $login)) { throw new RestoreError('確認用ログインの名前は英数字と . _ - で指定してください。', 'adminLogin'); }
+        $createAdmin = $text('createPreviewAdmin');
+        if (!in_array($createAdmin, ['', '0', '1'], true)) { throw new RestoreError('確認用管理者を作成するか確認してください。', 'createPreviewAdmin'); }
+        $login = $createAdmin === '1' ? $text('adminLogin') : null;
+        if ($login !== null && !preg_match('/\A[A-Za-z0-9_.-]{1,60}\z/D', $login)) { throw new RestoreError('確認用ログインの名前は英数字と . _ - で指定してください。', 'adminLogin'); }
         $plan['adminLogin'] = $login;
         $root = $text('root');
         if ($root !== '' && !preg_match('/\Ar[0-9]{4}\z/D', $root)) { throw new RestoreError('WordPressの保存ルートは r0001 の形式で指定してください。', 'root'); }
         $plan['root'] = $root === '' ? null : $root;
         return $plan;
+    }
+
+    public static function urlMode(array $plan): string
+    {
+        return $plan['urlMode'] ?? (($plan['targetUrl'] ?? null) === null ? 'keep' : 'database');
+    }
+
+    public static function publicationUrls(array $plan): array
+    {
+        $home = $plan['targetUrl'] ?? $plan['configHome'] ?? null;
+        return ['home' => $home, 'siteurl' => $plan['targetSiteUrl'] ?? $home];
+    }
+
+    private static function targetUrl(string $value, string $field): string
+    {
+        $url = rtrim($value, '/');
+        try { SiteUrlRewriter::assertUrl($url, false); }
+        catch (\RuntimeException $ignored) { throw new RestoreError('アドレスは https://example.com の形で入力してください。', $field); }
+        $parts = parse_url($url);
+        $path = $parts['path'] ?? '';
+        $host = strtolower(rtrim($parts['host'], '.'));
+        $ip = @inet_pton(trim($host, '[]'));
+        $mappedPrefix = str_repeat("\0", 10) . "\xff\xff";
+        if (preg_match('/(?:^|\.)localhost\z/D', $host) || $ip === str_repeat("\0", 15) . "\1" || $ip === str_repeat("\0", 16)
+            || (is_string($ip) && strlen($ip) === 4 && (ord($ip[0]) === 127 || $ip === str_repeat("\0", 4)))
+            || (is_string($ip) && strncmp($ip, $mappedPrefix, 12) === 0 && ord($ip[12]) === 127)
+            || ($ip === false && preg_match('/(?:^|\.)(?:[0-9]+|0x[0-9a-f]+)\z/D', $host))) {
+            throw new RestoreError('運用URLには確認用のローカルアドレスではなく、移行先のアドレスを指定してください。', $field);
+        }
+        if (strlen($url) > 2048 || strpbrk($path, '%\\') !== false || strpos($path, '//') !== false || preg_match('~(?:^|/)\.{1,2}(?:/|$)~D', $path)) {
+            throw new RestoreError('アドレスのパスに、%で始まる表記、連続したスラッシュ、または . や .. を含めないでください。', $field);
+        }
+        return self::origin($url) . $path;
+    }
+
+    private static function origin(string $url): string
+    {
+        $parts = parse_url($url);
+        $port = $parts['port'] ?? null;
+        return $parts['scheme'] . '://' . strtolower(rtrim($parts['host'], '.')) . ($port === null || $port === ($parts['scheme'] === 'https' ? 443 : 80) ? '' : ':' . $port);
     }
 
     /** The bound value for a canonical request and the facts checked for it. */

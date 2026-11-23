@@ -70,6 +70,29 @@ final class SqliteSiteSetupTest extends TestCase
         $db = null;
     }
 
+    /** @dataProvider previewVariants */
+    public function testMigrationDatabaseKeepsPermanentUrlsAndExcludesPreviewAdmin(?string $target, bool $createAdmin): void
+    {
+        $source = 'https://source.invalid';
+        $login = $createAdmin ? ['login' => 'preview-only', 'passwordHash' => '$P$B' . str_repeat('.', 30)] : [];
+        $migration = $this->root . '/migration.sqlite';
+        (new SqliteSiteSetup($this->implementation))->prepare($this->source, $this->root . '/running', $this->database,
+            $this->root . '/running.sqlite', $source, 'http://127.0.0.1:18889', 'wp_', $login, [], $target ?? $source, $migration);
+        foreach ([$this->database => [$source, 0], $migration => [$target ?? $source, 0], $this->root . '/running.sqlite' => [$target ?? $source, (int) $createAdmin]] as $path => [$url, $users]) {
+            $db = new \SQLite3($path, SQLITE3_OPEN_READONLY);
+            try {
+                self::assertSame($url, $db->querySingle("SELECT option_value FROM wp_options WHERE option_name='home'"));
+                self::assertSame($url, $db->querySingle("SELECT option_value FROM wp_options WHERE option_name='siteurl'"));
+                self::assertSame($users, $db->querySingle("SELECT COUNT(*) FROM wp_users WHERE user_login='preview-only'"));
+            } finally { $db->close(); }
+        }
+    }
+
+    public function previewVariants(): array
+    {
+        return [[null, false], [null, true], ['https://target.invalid', false], ['https://target.invalid', true]];
+    }
+
     public function testAnExistingSiteIsRejectedBeforeAnyOverwrite(): void
     {
         mkdir($this->root . '/running', 0700); file_put_contents($this->root . '/running/keep', 'keep');

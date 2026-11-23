@@ -43,7 +43,13 @@ final class V4RestorerTest extends TestCase
 
     public function testSnapshotAloneRestoresSplitFilesRootsLinksModesAndIndependentInodes(): void
     {
-        $result = $this->recover();
+        $events = [];
+        $result = $this->recover(false, null, static function (?array $event) use (&$events): void { $events[] = $event; });
+        $packs = $this->manifest['counts']['packs'];
+        self::assertSame(['unit' => 'packs', 'done' => 0, 'total' => $packs], $events[0]);
+        self::assertContains(['unit' => 'packs', 'done' => $packs, 'total' => $packs], $events);
+        self::assertContains(['unit' => 'files', 'done' => 2, 'total' => 2], $events);
+        self::assertNull(end($events));
         $root = $this->directory . '/restored/roots/r0001';
         self::assertSame(2, $result['files']); self::assertSame(1, $result['links']); self::assertFalse($result['databaseImported']);
         self::assertSame('hello world', file_get_contents($root . '/a.txt'));
@@ -634,10 +640,10 @@ final class V4RestorerTest extends TestCase
         $stream = fopen('php://memory', 'w+b'); fwrite($stream, file_get_contents($this->keys[0]['identity'])); rewind($stream); return $stream;
     }
 
-    private function recover(bool $resume = false, ?string $localMediaDryRunPrefix = null): array
+    private function recover(bool $resume = false, ?string $localMediaDryRunPrefix = null, ?callable $progress = null): array
     {
         $stream = $this->identity();
-        try { return $this->restorer()->recover($this->manifest, $this->receipt, $stream, $this->directory . '/restored', null, null, $resume, null, $localMediaDryRunPrefix); }
+        try { return $this->restorer()->recover($this->manifest, $this->receipt, $stream, $this->directory . '/restored', null, null, $resume, null, $localMediaDryRunPrefix, null, $progress); }
         finally { fclose($stream); }
     }
 

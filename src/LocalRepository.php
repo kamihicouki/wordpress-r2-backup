@@ -185,7 +185,22 @@ final class LocalRepository implements ObjectWriter, ObjectReader
         return $result;
     }
 
-    public function completed(string $snapshotId): array
+    /** List completion records without reading or hashing every referenced object. */
+    public function listCandidates(): array
+    {
+        $result = [];
+        foreach ($this->snapshotIds() as $snapshotId) {
+            try {
+                $record = $this->completionMetadata($snapshotId);
+                Manifest::validateReceipt($record['manifest']);
+                $valid = true;
+            } catch (RuntimeException | InvalidArgumentException $error) { $valid = false; }
+            $result[] = ['snapshotId' => $snapshotId, 'valid' => $valid, 'verified' => false];
+        }
+        return $result;
+    }
+
+    public function completionMetadata(string $snapshotId): array
     {
         $this->requireRole(false);
         self::identifier($snapshotId);
@@ -204,6 +219,12 @@ final class LocalRepository implements ObjectWriter, ObjectReader
             || ($record['manifest']['key'] ?? null) !== 'manifests/' . $snapshotId . '.age') {
             throw new RuntimeException('Invalid completion record.');
         }
+        return $record;
+    }
+
+    public function completed(string $snapshotId): array
+    {
+        $record = $this->completionMetadata($snapshotId);
         try {
             $this->verifyStored($record['manifest']);
             if (array_key_exists('objects', $record)) {

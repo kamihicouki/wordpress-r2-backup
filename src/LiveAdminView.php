@@ -391,7 +391,7 @@ final class LiveAdminView
     {
         WordPressRestoreAdmin::render($settings);
         if ($settings === null) {
-            if (!defined('WRB_RESTORE_LOCAL_REPOSITORY')) { echo '<p class="wrb-empty">バックアップの保存先が未設定のため、復元できません。<a href="' . esc_url(LiveAdmin::url('storage')) . '">ストレージ設定</a>から接続してください。</p>'; }
+            if (!defined('WRB_RESTORE_LOCAL_REPOSITORY')) { echo '<p class="wrb-empty">保存先は未設定です。接続ファイルを選ぶか、<a href="' . esc_url(LiveAdmin::url('storage')) . '">ストレージ設定</a>から接続してください。</p>'; }
             return;
         }
         echo '<details class="wrb-panel wrb-r-admin-tools"' . (isset($_GET['wrb_list']) ? ' open' : '') . '><summary><strong>バックアップの管理と別環境への備え</strong></summary>';

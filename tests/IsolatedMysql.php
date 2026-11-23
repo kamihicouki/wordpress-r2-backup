@@ -113,6 +113,8 @@ final class IsolatedMysql
         return rtrim($real, '/') . '/';
     }
 
+    public static function mariadbBin(): string { return self::configuredMariaBase('mariadb') . 'bin/'; }
+
     public static function mariadb105Bin(): string { return self::configuredMariaBase('mariadb105') . 'bin/'; }
 
     public static function mariadb105Available(): bool { return self::available('mariadb105'); }

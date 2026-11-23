@@ -230,6 +230,20 @@ final class DirectR2RepositoryTest extends TestCase
         $this->expectException(\RuntimeException::class); DirectR2Repository::fromFile($profile);
     }
 
+    public function testCandidateListDoesNotClaimOrPerformPayloadVerification(): void
+    {
+        $repo = $this->repository(); $id = str_repeat('1', 64);
+        file_put_contents($this->directory . '/input', 'encrypted-test-body');
+        $manifest = $repo->putNew('manifests/' . $id . '.age', $this->directory . '/input');
+        $repo->publish($id, $manifest);
+        unset($this->objects['/backup-test/wordpress-r2/' . $this->connection['unitId'] . '/' . $manifest['key']]);
+        $items = $repo->listCandidates();
+        self::assertSame($id, $items[0]['snapshotId']);
+        self::assertFalse($items[0]['verified']);
+        $this->expectException(\RuntimeException::class);
+        $repo->completed($id);
+    }
+
     private ?string $failOperation = null;
 
     private function retentionRepository(int $now = 1700000000): DirectR2Repository

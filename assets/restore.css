@@ -18,6 +18,7 @@
 .wrb-r-choice{border:0;margin:0 0 12px;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
 .wrb-r-choice legend{grid-column:1/-1}
 .wrb-r-choice label{display:block;border:1px solid var(--wrb-r-line);border-radius:4px;padding:9px 11px;cursor:pointer}
+.wrb-r-choice label[hidden]{display:none}
 .wrb-r-pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 12px}
 .wrb-restore details{margin:0 0 10px;border-top:1px solid var(--wrb-r-line);padding-top:8px}
 .wrb-restore summary{cursor:pointer;font-weight:600;min-height:28px}
@@ -46,6 +47,13 @@
 body>main>.wrb-restore{margin:0 auto;padding:16px}
 .wrb-r-message{position:sticky;bottom:0;background:var(--wrb-r-bg);padding:4px 0}
 .wrb-r-message:empty{padding:0;min-height:0}
+.wrb-r-progress-phase{margin:10px 0 3px;font-weight:600}
+.wrb-r-progress{display:block;inline-size:100%;accent-color:var(--wrb-r-accent)}
+.wrb-r-progress-detail{margin:3px 0 12px}
+.wrb-r-access{border:1px solid var(--wrb-r-line);border-radius:5px;padding:10px 12px;margin:12px 0}
+.wrb-r-access .wrb-r-subhead{margin:0 0 8px}
+.wrb-r-access .wrb-r-summary{margin:0;grid-template-columns:minmax(0,1fr);row-gap:2px}
+.wrb-r-access dd + dt{margin-top:6px}
 .wrb-r-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .wrb-r-subhead{font-size:15px;margin:18px 0 10px}
 .wrb-r-next{display:grid;gap:2px;margin:0 0 12px;padding:10px 12px;background:var(--wrb-r-soft);border-left:4px solid var(--wrb-r-accent);border-radius:2px}
@@ -67,3 +75,7 @@ form.wrb-r-main[hidden]{display:none}
 .wrb-r-admin-tools{margin-top:18px}
 .wrb-restore fieldset.wrb-r-choice{border:0;padding:0;margin:0 0 12px}
 .wrb-restore details>summary{padding:2px 0}
+
+.wrb-r-headline.wrb-r-complete{padding:10px 12px;background:#edf7ee;color:var(--wrb-r-ok);border-radius:4px}
+
+.wrb-r-url-group{margin:0 0 14px;padding:12px 14px;border:1px solid var(--wrb-r-line);border-radius:5px}.wrb-r-url-group h3{margin:0 0 8px;font-size:14px}.wrb-r-url-group p{margin:0 0 8px}.wrb-r-url-group details{margin:8px 0 0}.wrb-r-url-group dl{margin:6px 0 10px}.wrb-r-url-group dt{font-weight:600}.wrb-r-url-group dd{margin:0 0 6px}.wrb-r-url-group [hidden]{display:none!important}

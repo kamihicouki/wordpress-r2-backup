@@ -47,8 +47,13 @@ final class RestoreRealWordPress
         $site = $this->root . '/source-site';
         $this->copyCore($site);
         Fixture::write($site, 'wp-content/uploads/2026/11/synthetic.bin', "\x00\xffsynthetic-media");
-        $this->writeConfig($site, $schema, 'root', '', ['WP_HOME' => RestoreTestBed::SOURCE_URL, 'WP_SITEURL' => RestoreTestBed::SOURCE_URL]);
-        $this->install($site, 'source.invalid', bin2hex(random_bytes(16)), "wp_insert_post(['post_title'=>'合成の公開記事','post_content'=>'<a href=\"" . RestoreTestBed::SOURCE_URL . "/wrb\">本文リンク</a>','post_status'=>'publish']);");
+        $this->writeConfig($site, $schema, 'root', '', []);
+        $sourceUrl = var_export(RestoreTestBed::SOURCE_URL, true);
+        // Give wp_guess_url() the source's HTTPS admin request before WordPress creates its default content.
+        $this->install($site, 'source.invalid', bin2hex(random_bytes(16)),
+            "update_option('home', $sourceUrl); update_option('siteurl', $sourceUrl); "
+            . "wp_insert_post(['post_title'=>'合成の公開記事','post_content'=>'<a href=\"" . RestoreTestBed::SOURCE_URL . "/wrb\">本文リンク</a>','post_status'=>'publish']);",
+            ['HTTPS' => 'on', 'REQUEST_URI' => '/wp-admin/install.php']);
         $connection = mysqli_init();
         if (!$connection || !mysqli_real_connect($connection, 'localhost', 'root', '', $schema, 0, $server->workspace() . '/mysql.sock')) { throw new RuntimeException('Cannot connect to the source.'); }
         mysqli_set_charset($connection, 'utf8mb4');
@@ -108,10 +113,10 @@ final class RestoreRealWordPress
         file_put_contents($site . '/wp-config.php', $config . "\$table_prefix = 'wp_';\nif (!defined('ABSPATH')) { define('ABSPATH', __DIR__ . '/'); }\nrequire_once ABSPATH . 'wp-settings.php';\n");
     }
 
-    private function install(string $site, string $host, string $password, string $after): void
+    private function install(string $site, string $host, string $password, string $after, array $request = []): void
     {
         $script = $this->root . '/install-' . bin2hex(random_bytes(4)) . '.php';
-        file_put_contents($script, '<?php define("WP_INSTALLING", true); $_SERVER["HTTP_HOST"]=' . var_export($host, true) . '; require ' . var_export($site . '/wp-load.php', true) . '; add_filter("pre_wp_mail", static function () { return true; }); require ABSPATH . "wp-admin/includes/upgrade.php"; wp_install("合成サイト", "synthetic-owner", "owner@example.invalid", true, "", ' . var_export($password, true) . ', "ja"); ' . $after);
+        file_put_contents($script, '<?php define("WP_INSTALLING", true); $_SERVER=' . var_export(['HTTP_HOST' => $host] + $request, true) . ' + $_SERVER; require ' . var_export($site . '/wp-load.php', true) . '; add_filter("pre_wp_mail", static function () { return true; }); require ABSPATH . "wp-admin/includes/upgrade.php"; wp_install("合成サイト", "synthetic-owner", "owner@example.invalid", true, "", ' . var_export($password, true) . ', "ja"); ' . $after);
         self::run([PHP_BINARY, $script], $site);
         unlink($script);
     }
