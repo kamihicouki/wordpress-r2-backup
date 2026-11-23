@@ -8,9 +8,20 @@ final class BackupHistory
     private const MAX_RUNS = 720;
     private const MAX_EVENTS = 24;
     private const MAX_BYTES = 3145728;
+    // Preserve the journal format understood by earlier releases. Retry details refine existing events.
+    private const RETRY_EVENTS = [
+        'auto_resume_config_changed' => 'transfer_failed',
+        'auto_resume_waiting' => 'transfer_connection',
+        'auto_resume_exhausted' => 'transfer_connection',
+        'auto_resume_queued' => 'resume_queued',
+    ];
     private const EVENTS = [
         'queued' => ['queued', 'バックアップの起動を待っています。'],
         'resume_queued' => ['queued', '転送の再開を待っています。'],
+        'auto_resume_config_changed' => ['interrupted', '取得時の設定または接続・復号の確認状態が変わったため、自動再開を停止しました。取得時の設定を確認してください。'],
+        'auto_resume_waiting' => ['interrupted', 'R2への接続が途切れました。保存済みの位置からの自動再開を待っています。'],
+        'auto_resume_queued' => ['queued', '一時的なR2接続エラーのため、保存済みの位置から転送を自動再開します。'],
+        'auto_resume_exhausted' => ['interrupted', 'R2接続エラーが続き、自動再開が上限の3回に達しました。接続を確認して「転送を再開」を実行してください。'],
         'capture_started' => ['capturing', 'ファイルとデータベースの取得を開始しました。'],
         'upload_started' => ['uploading', '取得と暗号化が完了し、R2への転送を開始しました。'],
         'resumed' => ['uploading', '保存済みの位置から転送を再開しました。'],
@@ -65,7 +76,11 @@ final class BackupHistory
     private static function displayRun(array $run): array
     {
         unset($run['_launchId'], $run['_resume']);
-        foreach ($run['events'] as &$event) { $event['message'] = self::EVENTS[$event['code']][1]; }
+        foreach ($run['events'] as &$event) {
+            $detail = $event['retry'] ?? null;
+            if (is_string($detail) && (self::RETRY_EVENTS[$detail] ?? null) === $event['code']) { $event['code'] = $detail; }
+            $event['message'] = self::EVENTS[$event['code']][1];
+        }
         unset($event);
         return $run;
     }
@@ -255,9 +270,12 @@ final class BackupHistory
         $at = self::now();
         $status = self::EVENTS[$code][0];
         $last = end($run['events']);
-        if ($last !== false && $last['code'] === $code
+        $storedCode = self::RETRY_EVENTS[$code] ?? $code;
+        if ($last !== false && $last['code'] === $storedCode && ($last['retry'] ?? $storedCode) === $code
             && (!self::isId($state['launchId'] ?? null) || ($run['_launchId'] ?? null) === $state['launchId'])) { return false; }
-        $run['events'][] = ['at' => $at, 'code' => $code];
+        $event = ['at' => $at, 'code' => $storedCode];
+        if ($storedCode !== $code) { $event['retry'] = $code; }
+        $run['events'][] = $event;
         if (count($run['events']) > self::MAX_EVENTS) { array_splice($run['events'], 1, 1); }
         $run['status'] = $status; $run['updatedAt'] = $at;
         if (in_array($status, ['complete', 'failed', 'interrupted', 'cancelled', 'skipped'], true)) {
@@ -270,7 +288,7 @@ final class BackupHistory
         }
         if (self::isId($state['snapshotId'] ?? null)) { $run['snapshotId'] = $state['snapshotId']; }
         if (self::isId($state['launchId'] ?? null)) { $run['_launchId'] = $state['launchId']; }
-        if ($code === 'resume_queued') { $run['_resume'] = true; }
+        if ($code === 'resume_queued' || $code === 'auto_resume_queued') { $run['_resume'] = true; }
         elseif ($status !== 'queued') { unset($run['_resume']); }
         if ($bytes !== null && $bytes >= 0 && $status === 'complete') { $run['bytes'] = $bytes; }
         return true;

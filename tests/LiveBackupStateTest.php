@@ -9,6 +9,21 @@ final class LiveBackupStateTest extends TestCase
 {
     protected function tearDown(): void { Fixture::cleanup(); }
 
+    public function testAutomaticResumeRequiresAReadyCurrentScheduledOperation(): void
+    {
+        $revision = str_repeat('a',64);
+        $schedule = ['enabled'=>true,'mode'=>'online','revision'=>$revision];
+        $state = ['status'=>'uploading','consistencyMode'=>'online','scheduleRevision'=>$revision,'autoResumeAt'=>100,'autoResumeAttempts'=>0];
+        self::assertTrue(LiveBackup::scheduledRetryDue($state,$schedule,100));
+        self::assertFalse(LiveBackup::scheduledRetryDue($state,$schedule,99));
+        foreach ([['status'=>'queued'], ['status'=>'cancelled'], ['scheduleRevision'=>null], ['scheduleRevision'=>str_repeat('b',64)],
+            ['autoResumeAttempts'=>3], ['autoResumeAttempts'=>-1], ['autoResumeAt'=>null], ['consistencyMode'=>'maintenance']] as $override) {
+            self::assertFalse(LiveBackup::scheduledRetryDue(array_replace($state,$override),$schedule,100));
+        }
+        self::assertFalse(LiveBackup::scheduledRetryDue($state,array_replace($schedule,['enabled'=>false]),100));
+        self::assertFalse(LiveBackup::scheduledRetryDue(['status'=>'uploading','consistencyMode'=>'online'],$schedule,100));
+    }
+
     public function testMaintenanceRefreshPreservesIdentityAndOwnershipButRejectsAnotherOwner(): void
     {
         $directory = Fixture::temp(); $path = $directory . '/.maintenance'; $token = str_repeat('a', 32);

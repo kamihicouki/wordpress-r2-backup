@@ -32,7 +32,7 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $r=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$path]);
         self::assertSame(0,$r['exit'],$r['err']); return json_decode($r['out'],true,32,JSON_THROW_ON_ERROR);
     }
-    public function testOnlineClaimsAndQueuesOnceWithFrozenSettingsAndRejectsBusy(): void
+    private function prepare(): array
     {
         if(getenv('WRB_RUN_V4_MYSQL_INTEGRATION')!=='1') { self::markTestSkipped('Isolated WordPress integration is not enabled.'); }
         $this->db=IsolatedMysql::start(null,'DISABLED'); $this->wp=IsolatedWordPress::start($this->db); $this->scratch=Fixture::temp();
@@ -45,6 +45,12 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $seed=$this->evalWp('$s=WordPressR2Backup\\LiveSettings::validate('.var_export($settings,true).'); $s["connectionVerified"]=true; $s["proofs"]=[["confirmed"=>true],["confirmed"=>true]]; WordPressR2Backup\\LiveSettings::save($s);'
             .'update_option("timezone_string","UTC"); update_option("wrb_live_schedule",'.var_export($config,true).',false);'
             .'echo json_encode(["digest"=>hash("sha256",json_encode($s,JSON_THROW_ON_ERROR))]);');
+        return [$plugin, $config, $seed];
+    }
+
+    public function testOnlineClaimsAndQueuesOnceWithFrozenSettingsAndRejectsBusy(): void
+    {
+        [$plugin, $config, $seed] = $this->prepare();
         $run=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
         self::assertSame(0,$run['exit'],$run['err']);
         $status=$this->evalWp('echo json_encode(["schedule"=>get_option("wrb_live_schedule_runner"),"operation"=>get_option("wrb_live_operation")]);');
@@ -97,5 +103,123 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $run=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]); self::assertSame(0,$run['exit'],$run['err']);
         $inactive=$this->evalWp('echo json_encode(["schedule"=>get_option("wrb_live_schedule_runner"),"operation"=>get_option("wrb_live_operation")]);');
         self::assertSame('unavailable',$inactive['schedule']['lastResult']); self::assertSame(['status'=>'complete'],$inactive['operation']);
+    }
+
+    public function testScheduledConnectionFailuresResumeTheSavedJobAcrossCliProcesses(): void
+    {
+        [$plugin, $config] = $this->prepare();
+        $tick = function () use ($plugin): void {
+            $result = $this->process([PHP_BINARY, '-d', 'sys_temp_dir='.$this->scratch, $plugin.'/schedule.php', $this->wp->root()]);
+            self::assertSame(0, $result['exit'], $result['err']);
+        };
+        $read = fn (): array => $this->evalWp('echo json_encode(get_option("wrb_live_operation"));');
+        $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo "{}";');
+        $tick();
+        $initial = $read();
+        $objects = $this->scratch.'/r2';
+        self::assertTrue(mkdir($objects, 0700));
+        $worker = 'require '.var_export(__DIR__.'/MemoryR2Transport.php', true).';'
+            .'$fault=0; $s=WordPressR2Backup\LiveSettings::load(); $memory=new WordPressR2Backup\Tests\MemoryR2Transport('.var_export($objects,true).');'
+            .'$transport=static function(array $request, callable $consume) use ($memory,&$fault){'
+            .'if($fault && $request["method"]==="PUT") throw new WordPressR2Backup\R2TransportException($fault);'
+            .'return $memory($request,$consume);};'
+            .'$b=new WordPressR2Backup\LiveBackup($s,new WordPressR2Backup\DirectR2Repository(array_intersect_key($s,array_flip(["accountId","bucket","accessKeyId","secretAccessKey","unitId"])),$transport));'
+            .'$a=$b->state();';
+        $started = $this->evalWp($worker.'$b->begin($a["launchId"]); echo json_encode($b->step());');
+        self::assertGreaterThan(0, $started['completed']);
+        $fault = '$fault=7; try { $b->step(); } catch (WordPressR2Backup\R2TransportException $error) {} echo json_encode($b->state());';
+        $paused = $this->evalWp($worker.$fault);
+        self::assertSame($started['completed'], $paused['completed']);
+        $tls = $this->evalWp($worker.str_replace('$fault=7;', '$fault=60;', $fault));
+        self::assertArrayNotHasKey('autoResumeAt', $tls, 'A TLS error must clear a pending connection retry');
+        $tick();
+        self::assertSame($tls, $read());
+        $paused = $this->evalWp($worker.$fault);
+        $dueNow = function (): void {
+            // Move only the due time in the isolated database, then start a fresh real scheduler process.
+            $this->evalWp('$a=get_option("wrb_live_operation"); $a["autoResumeAt"]=time()-1; update_option("wrb_live_operation",$a,false); echo "{}";');
+        };
+        // A binding mismatch stops recovery before ticket creation. Further ticks leave diagnosis visible.
+        $dueNow();
+        $this->evalWp('$a=get_option("wrb_live_operation"); $a["settingsDigest"]=str_repeat("0",64); update_option("wrb_live_operation",$a,false); echo "{}";');
+        $invalid = $this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
+        self::assertSame(1,$invalid['exit']);
+        $blocked=$read();
+        self::assertArrayNotHasKey('autoResumeAt',$blocked);
+        self::assertSame(0,$blocked['autoResumeAttempts']);
+        $tick();
+        self::assertSame($blocked,$read());
+        $this->evalWp('update_option("wrb_live_operation",'.var_export($paused,true).',false); echo "{}";');
+        $resumeWorker = '$ticket=json_decode(file_get_contents($b->workspace()."/launch-".$a["launchId"].".json"),true);'
+            .'try {$b->runQueued($a["launchId"],$ticket);} catch (WordPressR2Backup\R2TransportException $error) {} echo json_encode($b->state());';
+        foreach ([60, 300, 900] as $attempt => $delay) {
+            self::assertEqualsWithDelta(time()+$delay, $paused['autoResumeAt'], 5);
+            $tick();
+            self::assertSame($paused, $read(), 'Early ticks must preserve the interruption');
+            $dueNow();
+            if ($attempt === 0) {
+                $path=$this->evalWp('echo json_encode(["path"=>WordPressR2Backup\LiveSettings::workspace()]);')['path'];
+                $lock=fopen($path.'/runner.lock','c+b'); self::assertTrue(flock($lock,LOCK_EX|LOCK_NB));
+                try { $tick(); self::assertSame('uploading', $read()['status']); }
+                finally { fclose($lock); }
+            }
+            $tick();
+            $queued = $read();
+            self::assertSame('queued', $queued['status']);
+            self::assertSame($initial['id'], $queued['id']);
+            self::assertSame($initial['snapshotId'], $queued['snapshotId']);
+            self::assertSame($started['completed'], $queued['completed']);
+            self::assertSame($attempt+1, $queued['autoResumeAttempts']);
+            $tick();
+            self::assertSame($queued, $read(), 'A second tick must not launch another worker');
+            $paused=$this->evalWp($worker.'$fault=7;'.$resumeWorker);
+        }
+        self::assertArrayNotHasKey('autoResumeAt', $paused);
+        $tick();
+        self::assertSame($paused, $read());
+        $history=$this->evalWp('echo json_encode((new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->latest());');
+        $codes=array_column($history['events'],'code');
+        self::assertSame(3, count(array_keys($codes,'auto_resume_queued',true)));
+        self::assertSame('auto_resume_exhausted', end($codes));
+
+        $request = var_export($config + ['operationId'=>$initial['id']],true);
+        // A manual resume wins after eligibility was observed and before the scheduler acquires the collection locks.
+        $due = $paused;
+        $due['autoResumeAttempts']=1; $due['autoResumeAt']=time()-1;
+        $this->evalWp('update_option("wrb_live_operation",'.var_export($due,true).',false);'.$worker.'$b->queue(str_repeat("e",64),true); echo "{}";');
+        self::assertNull($this->evalWp($worker.'echo json_encode(["result"=>$b->queue(str_repeat("f",64),true,"maintenance",'.$request.')]);')['result']);
+        $complete=$this->evalWp($worker.'$fault=0; $b->runQueued($a["launchId"]); echo json_encode($b->state());');
+        self::assertSame('complete', $complete['status']);
+        self::assertSame(1, $complete['autoResumeAttempts'], 'Verified progress must preserve the durable budget');
+        $tick();
+        self::assertSame($complete, $read());
+
+        // A cancellation between the advisory due check and the queue lock must win.
+        $this->evalWp('update_option("wrb_live_operation",'.var_export($due,true).',false);'.$worker.'$b->cancel(); echo "{}";');
+        self::assertNull($this->evalWp($worker.'echo json_encode(["result"=>$b->queue(str_repeat("f",64),true,"maintenance",'.$request.')]);')['result']);
+        $tick();
+        self::assertSame('cancelled',$read()['status']);
+
+        // Start another scheduled capture, interrupt after its first checkpoint, then let one automatic retry finish.
+        $config['time']=gmdate('H:i'); $config['revision']=str_repeat('c',64);
+        $this->evalWp('delete_option("wrb_live_schedule_runner"); update_option("wrb_live_schedule",'.var_export($config,true).',false); echo "{}";');
+        $tick();
+        $second=$read();
+        self::assertSame('queued',$second['status']);
+        self::assertNotSame($initial['id'],$second['id']);
+        $this->evalWp($worker.'$b->begin($a["launchId"]); echo json_encode($b->step());');
+        $this->evalWp($worker.$fault);
+        $dueNow();
+        $tick();
+        $recovered=$this->evalWp($worker.'$fault=0;'.$resumeWorker);
+        self::assertSame('complete',$recovered['status']);
+        self::assertSame($second['snapshotId'],$recovered['snapshotId']);
+        self::assertSame(1,$recovered['autoResumeAttempts']);
+        $history=$this->evalWp('echo json_encode((new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->find('.var_export($second['id'],true).'));');
+        $codes=array_column($history['events'],'code');
+        self::assertContains('final_verification',$codes);
+        self::assertSame('complete',end($codes));
     }
 }

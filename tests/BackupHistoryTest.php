@@ -54,6 +54,17 @@ final class BackupHistoryTest extends TestCase
         self::assertSame(0600, fileperms($directory . '/backup-history.json') & 0777);
     }
 
+    public function testRetryDetailsUseJournalCodesReadableByPreviousReleases(): void
+    {
+        $directory = Fixture::temp();
+        $history = new BackupHistory($directory);
+        $state = $this->state('d', 'uploading');
+        foreach (['auto_resume_waiting','auto_resume_queued','auto_resume_exhausted'] as $code) { $history->record($state,$code); }
+        $stored = json_decode(file_get_contents($directory.'/backup-history.json'),true,16,JSON_THROW_ON_ERROR);
+        self::assertSame(['transfer_connection','resume_queued','transfer_connection'],array_column($stored['runs'][0]['events'],'code'));
+        self::assertSame(['auto_resume_waiting','auto_resume_queued','auto_resume_exhausted'],array_column($history->latest()['events'],'code'));
+    }
+
     public function testSchedulerOutcomeDoesNotOverwriteAnActualRunAndHasStableVersion(): void
     {
         $history = new BackupHistory(Fixture::temp());

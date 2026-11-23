@@ -101,6 +101,17 @@ try {
             if ($state['lastResult'] !== 'started') { $record($slot, $config, $settings, $state['lastResult']); }
         } else { $state['status'] = 'not_due'; }
         $persist($state);
+        // Retry only a known interrupted scheduled operation, independently of the next new capture slot.
+        if (($config['enabled'] ?? false) === true && ($config['mode'] ?? null) === 'online') {
+            wp_cache_delete('wrb_live_operation', 'options'); wp_cache_delete('notoptions', 'options');
+            $active = get_option('wrb_live_operation', null);
+            if (is_array($active) && \WordPressR2Backup\LiveBackup::scheduledRetryDue($active, $config, $now->getTimestamp())) {
+                \WordPressR2Backup\BackupScheduler::assertOnlineRelease(__DIR__);
+                $settings = \WordPressR2Backup\LiveSettings::load();
+                if (!is_array($settings)) { throw new RuntimeException('Backup settings are missing.'); }
+                (new \WordPressR2Backup\LiveRunner($settings))->resumeScheduled($config, $active['id']);
+            }
+        }
         fwrite(STDOUT, json_encode(['status' => $state['status']], JSON_THROW_ON_ERROR) . "\n");
     });
 } catch (Throwable $error) {
