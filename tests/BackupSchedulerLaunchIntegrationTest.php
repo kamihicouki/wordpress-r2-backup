@@ -229,4 +229,61 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertContains('final_verification',$codes);
         self::assertSame('complete',end($codes));
     }
+    public function testHttp500ConditionalPutResumesOnlyWithVerifiedCiphertextAndWithinBudget(): void
+    {
+        [$plugin,$config] = $this->prepare();
+        $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo "{}";');
+        $tick = function () use ($plugin): void {
+            $result = $this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
+            self::assertSame(0,$result['exit'],$result['err']);
+        };
+        foreach (['stored','corrupt','persistent'] as $fault) {
+            $config['revision']=bin2hex(random_bytes(32)); $config['time']=gmdate('H:i');
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); update_option("wrb_live_schedule",'.var_export($config,true).',false); echo "{}";');
+            $directory=$this->scratch.'/'.$fault; self::assertTrue(mkdir($directory,0700));
+            $worker=function (string $action,string $fault) use ($directory): array {
+                return $this->evalWp('$directory='.var_export($directory,true).'; $action='.var_export($action,true).'; $fault='.var_export($fault,true).';'
+                    .'require '.var_export(__DIR__.'/fixtures/scheduled-cipher-put.php',true).';');
+            };
+            $tick();
+            $start=$worker('capture','healthy');
+            self::assertNull($start['error']); self::assertGreaterThan(0,$start['state']['completed']);
+            $paused=$worker('step',$fault);
+            self::assertSame('R2 returned HTTP 500.',$paused['error']);
+            $budget=$fault==='persistent' ? [60,300,900] : [600];
+            foreach ($budget as $attempt=>$delay) {
+                $state=$paused['state'];
+                self::assertSame($start['state']['completed'],$state['completed']);
+                self::assertEqualsWithDelta(time()+$delay,$state['autoResumeAt'],5);
+                $tick();
+                self::assertSame($state,$this->evalWp('echo json_encode(get_option("wrb_live_operation"));'));
+                $this->evalWp('$a=get_option("wrb_live_operation"); $a["autoResumeAt"]=time()-1; update_option("wrb_live_operation",$a,false); echo "{}";');
+                $tick();
+                $paused=$worker('resume',$fault==='persistent' ? 'persistent' : 'healthy');
+                self::assertSame($start['state']['snapshotId'],$paused['state']['snapshotId']);
+                self::assertSame($attempt+1,$paused['state']['autoResumeAttempts']);
+            }
+            $codes=array_column($paused['events'],'code');
+            self::assertArrayNotHasKey('autoResumeAt',$paused['state']);
+            if ($fault !== 'persistent') {
+                self::assertContains(['PUT',412],$paused['trace']);
+                self::assertContains(['HEAD',200],$paused['trace']);
+                self::assertContains(['GET',200],$paused['trace']);
+            }
+            if ($fault === 'stored') {
+                self::assertNull($paused['error']); self::assertSame('complete',$paused['state']['status']);
+                self::assertContains('final_verification',$codes); self::assertSame('complete',end($codes));
+            } else {
+                self::assertSame($start['state']['completed'],$paused['state']['completed']);
+                self::assertSame($fault === 'persistent' ? 'auto_resume_exhausted' : 'transfer_failed',end($codes));
+                self::assertSame($fault === 'persistent' ? 'R2 returned HTTP 500.' : 'Ciphertext verification failed.',$paused['error']);
+                $tick();
+                self::assertSame($paused['state'],$this->evalWp('echo json_encode(get_option("wrb_live_operation"));'));
+                $this->evalWp('(new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load()))->cancel(); echo "{}";');
+            }
+        }
+    }
+
 }

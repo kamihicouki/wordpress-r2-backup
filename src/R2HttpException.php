@@ -8,10 +8,11 @@ final class R2HttpException extends \RuntimeException
 {
     private ?int $retryNotBefore;
 
-    public function __construct(int $status, ?string $retryAfter)
+    public function __construct(int $status, ?string $retryAfter, bool $conditionalCipherPut = false)
     {
         parent::__construct('R2 returned HTTP ' . $status . '.', $status);
-        $this->retryNotBefore = in_array($status, [429, 503], true) ? self::retryTime($retryAfter) : null;
+        $canResume = in_array($status, [429, 503], true) || ($status === 500 && $conditionalCipherPut);
+        $this->retryNotBefore = $canResume ? self::retryTime($retryAfter) : null;
     }
 
     /** Null requires manual intervention. Zero leaves the normal scheduled backoff in effect. */

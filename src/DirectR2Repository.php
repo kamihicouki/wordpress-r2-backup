@@ -614,7 +614,11 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         foreach (['auto', 's3', 'aws4_request'] as $part) { $signing = hash_hmac('sha256', $part, $signing, true); }
         $signature = hash_hmac('sha256', "AWS4-HMAC-SHA256\n" . $date . "\n" . $scope . "\n" . $requestHash, $signing);
         $headers['authorization'] = 'AWS4-HMAC-SHA256 Credential=' . $this->connection['accessKeyId'] . '/' . $scope . ', SignedHeaders=' . $signed . ', Signature=' . $signature;
-        $flags = (object) ['received' => 0, 'overflow' => false, 'refused' => false];
+        // putNew()/putNewPages() validate each .age receipt, use create-only writes, and re-read the
+        // complete existing ciphertext after a conflict. Metadata writes have a different recovery contract.
+        $conditionalCipherPut = $method === 'PUT' && ($headers['if-none-match'] ?? null) === '*'
+            && is_resource($body) && $key !== null && str_ends_with($key, '.age');
+        $flags = (object) ['received' => 0, 'overflow' => false, 'refused' => false, 'conditionalCipherPut' => $conditionalCipherPut];
         $bounded = static function (string $chunk) use ($consume, $limit, $flags): int {
             $length = strlen($chunk);
             if ($length > $limit - $flags->received) { $flags->overflow = true; return 0; }
@@ -661,7 +665,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         }
         if (!in_array($status, $allowed, true)) {
             error_log(sprintf('wrb-r2-response method=%s reason=http_status status=%d', $method, $status));
-            throw new R2HttpException($status, $normalized['retry-after'] ?? null);
+            throw new R2HttpException($status, $normalized['retry-after'] ?? null, $flags->conditionalCipherPut);
         }
         return ['status' => $status, 'headers' => $normalized];
     }

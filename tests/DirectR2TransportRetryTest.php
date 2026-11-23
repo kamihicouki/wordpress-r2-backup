@@ -240,6 +240,34 @@ final class DirectR2TransportRetryTest extends TestCase
         }
     }
 
+    public function testHttp500MustComeFromAConditionalCiphertextWrite(): void
+    {
+        $repository=$this->repository(static fn (): array => ['status'=>500,'headers'=>['retry-after'=>'60']]);
+        $send=new \ReflectionMethod($repository,'request'); $send->setAccessible(true);
+        $stream=fopen('php://temp','w+b'); fwrite($stream,'x');
+        try {
+            foreach ([
+                ['PUT',$this->receipt['key'],['if-none-match'=>'*'],true],
+                ['PUT',$this->receipt['key'],[],false],
+                ['PUT','commits/'.str_repeat('a',64).'.json',['if-none-match'=>'*'],false],
+                ['HEAD',$this->receipt['key'],[],false],
+                ['GET',$this->receipt['key'],[],false],
+                ['DELETE',$this->receipt['key'],[],false],
+            ] as [$method,$key,$headers,$eligible]) {
+                rewind($stream);
+                try {
+                    $send->invoke($repository,$method,$key,[],$method==='PUT'?$stream:null,$method==='PUT'?1:0,
+                        hash('sha256',$method==='PUT'?'x':''),$headers,static fn (string $s): int => strlen($s),1024,[200]);
+                    self::fail('Unexpected HTTP 500 accepted');
+                } catch (R2HttpException $error) {
+                    if ($eligible) { self::assertEqualsWithDelta(time()+60,$error->retryNotBefore(),1); }
+                    else { self::assertNull($error->retryNotBefore()); }
+                }
+            }
+        } finally { fclose($stream); }
+        self::assertSame([], $this->waits);
+    }
+
     public function testTemporaryStatusCannotHideInvalidResponseOrLocalRefusal(): void
     {
         foreach (['response_limit','invalid_headers','ambiguous_retry_after'] as $case) {
