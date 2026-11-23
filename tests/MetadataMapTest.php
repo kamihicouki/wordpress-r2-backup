@@ -276,6 +276,38 @@ final class MetadataMapTest extends TestCase
         self::assertSame(['nested' => ['id' => 'saved']], $map->get('path'));
     }
 
+    public function testChangedProcessLocalLeafStillValidatesOtherRecordsAfterReadingAnotherLeaf(): void
+    {
+        $directory = Fixture::temp() . '/local';
+        $map = MetadataMap::createProcessLocal($directory);
+        $firstHash = hash('sha256', 'path');
+        $prefix = substr($firstHash, 0, 3);
+        for ($number = 0; ; ++$number) {
+            $neighbor = 'neighbor-' . $number;
+            $neighborHash = hash('sha256', $neighbor);
+            if (substr($neighborHash, 0, 3) === $prefix) { break; }
+        }
+        $map->put('path', ['id' => 1]);
+        $map->put($neighbor, ['id' => 2]);
+        $map->put('other', ['id' => 3]);
+        self::assertSame(['id' => 1], $map->get('path'));
+        self::assertSame(['id' => 3], $map->get('other'));
+
+        $leaf = $directory . '/leaf-' . $prefix . '.json';
+        $original = file_get_contents($leaf);
+        $data = json_decode($original, true, 16, JSON_THROW_ON_ERROR);
+        $data['records'][$neighborHash]['key'] = str_repeat('x', strlen($neighbor));
+        $flags = JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+        $data['checksum'] = hash('sha256', json_encode($data['records'], $flags));
+        $changed = json_encode($data, $flags);
+        self::assertSame(strlen($original), strlen($changed));
+        file_put_contents($leaf, $changed);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Invalid metadata record.');
+        $map->get('path');
+    }
+
     /** @dataProvider noncanonicalJsonValues */
     public function testGeneratedJsonMustStillPassTheExistingChecksumRules(array $value): void
     {
@@ -300,6 +332,8 @@ final class MetadataMapTest extends TestCase
             $expected['内容/' . $number] = ['id' => $number, 'sha256' => hash('sha256', (string) $number)];
             $local->put('内容/' . $number, $expected['内容/' . $number]); $durable->put('内容/' . $number, $expected['内容/' . $number]);
         }
+        self::assertSame($expected['内容/1'], $local->get('内容/1'));
+        self::assertSame($expected['内容/2'], $local->get('内容/2'));
         $local->put('内容/0', ['id' => 0, 'sha256' => hash('sha256', '0')]);
         $local->put('内容/1', ['id' => 'updated'], true); $durable->put('内容/1', ['id' => 'updated'], true); $expected['内容/1'] = ['id' => 'updated'];
         foreach ($expected as $key => $value) { self::assertSame($value, $local->get($key)); }
@@ -388,6 +422,8 @@ final class MetadataMapTest extends TestCase
         $directory = Fixture::temp() . '/local';
         $map = MetadataMap::createProcessLocal($directory);
         $map->put('path', ['id' => 'saved']); $map->put('other', ['id' => 'other']);
+        self::assertSame(['id' => 'saved'], $map->get('path'));
+        self::assertSame(['id' => 'other'], $map->get('other'));
         $leaf = $directory . '/leaf-' . substr(hash('sha256', 'path'), 0, 3) . '.json';
         $original = (string) file_get_contents($leaf);
         if ($change === 'valid JSON edited') {
