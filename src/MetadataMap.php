@@ -16,12 +16,14 @@ final class MetadataMap
     private int $maximumBytes;
     private int $maximumRecords;
     private bool $durable;
-    // Only one validated leaf and one bounded registry. Every use still reads all current bytes.
+    // Only one decoded leaf and one bounded registry. Every use still reads all current bytes.
     private const CACHE_RAW_BYTES = 262144;
     private int $cachedLeafMaximumBytes = 0;
     private string $cachedLeafPrefix = '';
     private string $cachedLeafBytes = '';
     private array $cachedLeafRecords = [];
+    /** Fully validated byte digests for at most the 4096 root leaves of a process-local map. */
+    private array $verifiedLeafDigests = [];
     private string $cachedBitmapBytes = '';
     private string $cachedBitmapBits = '';
 
@@ -85,6 +87,7 @@ final class MetadataMap
     private function invalidateCache(): void
     {
         $this->invalidateLeafCache();
+        $this->verifiedLeafDigests = [];
         $this->cachedBitmapBytes = ''; $this->cachedBitmapBits = '';
     }
 
@@ -164,7 +167,7 @@ final class MetadataMap
         $this->guard();
         $partitionInitialized = self::marked($this->bitmap(), $hash);
         if (!$partitionInitialized) { return null; }
-        $records = $this->leaf($this->partition($hash));
+        $records = $this->leaf($this->partition($hash), !$this->durable);
         if (!isset($records[$hash])) { return null; }
         if ($records[$hash]['key'] !== $key) { throw new RuntimeException('Metadata identity collision.'); }
         return $records[$hash]['value'];
@@ -227,11 +230,22 @@ final class MetadataMap
         return true;
     }
 
-    private function leaf(string $prefix): array
+    private function leaf(string $prefix, bool $reuseVerifiedDigest = false): array
     {
         $contents = self::readIn($this->directory, 'leaf-' . $prefix . '.json', $this->maximumBytes);
         if ($this->cachedLeafPrefix === $prefix && $this->cachedLeafMaximumBytes === $this->maximumBytes && $this->cachedLeafBytes === $contents) { return $this->cachedLeafRecords; }
         $data = json_decode($contents, true, 16, JSON_THROW_ON_ERROR);
+        $digest = null;
+        if ($reuseVerifiedDigest && strlen($prefix) === self::PREFIX_LENGTH && strlen($contents) <= self::CACHE_RAW_BYTES) {
+            // OpenSSL can use the host's SHA-256 instructions on these larger buffers.
+            $digest = function_exists('openssl_digest') ? openssl_digest($contents, 'sha256', true) : false;
+            if ($digest === false) { $digest = hash('sha256', $contents, true); }
+            // Only a digest recorded after full validation can authorize reuse of these freshly read bytes.
+            if (($this->verifiedLeafDigests[$prefix] ?? null) === $digest) {
+                $this->cacheLeaf($prefix, $contents, $data['records']);
+                return $data['records'];
+            }
+        }
         if (!is_array($data) || array_keys($data) !== ['version', 'records', 'checksum'] || $data['version'] !== 1 || !is_array($data['records'])
             || !is_string($data['checksum']) || !hash_equals($data['checksum'], hash('sha256', self::encodeRecords($data['records'])))) { throw new RuntimeException('Invalid metadata partition.'); }
         foreach ($data['records'] as $hash => $record) {
@@ -240,6 +254,7 @@ final class MetadataMap
                 || self::keyHash($record['key']) !== $hash) { throw new RuntimeException('Invalid metadata record.'); }
         }
         $this->cacheLeaf($prefix, $contents, $data['records']);
+        if ($digest !== null) { $this->verifiedLeafDigests[$prefix] = $digest; }
         return $data['records'];
     }
 
