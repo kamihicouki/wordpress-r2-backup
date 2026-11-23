@@ -137,7 +137,9 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertArrayNotHasKey('autoResumeAt', $tls, 'A TLS error must clear a pending connection retry');
         $tick();
         self::assertSame($tls, $read());
+        $failureStarted = time();
         $paused = $this->evalWp($worker.$fault);
+        $failureEnded = time();
         $dueNow = function (): void {
             // Move only the due time in the isolated database, then start a fresh real scheduler process.
             $this->evalWp('$a=get_option("wrb_live_operation"); $a["autoResumeAt"]=time()-1; update_option("wrb_live_operation",$a,false); echo "{}";');
@@ -156,7 +158,9 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $resumeWorker = '$ticket=json_decode(file_get_contents($b->workspace()."/launch-".$a["launchId"].".json"),true);'
             .'try {$b->runQueued($a["launchId"],$ticket);} catch (WordPressR2Backup\R2TransportException $error) {} echo json_encode($b->state());';
         foreach ([60, 300, 900] as $attempt => $delay) {
-            self::assertEqualsWithDelta(time()+$delay, $paused['autoResumeAt'], 5);
+            // Compare the deadline to the failed worker, before running independent scheduler checks.
+            self::assertGreaterThanOrEqual($failureStarted + $delay, $paused['autoResumeAt']);
+            self::assertLessThanOrEqual($failureEnded + $delay, $paused['autoResumeAt']);
             $tick();
             self::assertSame($paused, $read(), 'Early ticks must preserve the interruption');
             $dueNow();
@@ -175,7 +179,9 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             self::assertSame($attempt+1, $queued['autoResumeAttempts']);
             $tick();
             self::assertSame($queued, $read(), 'A second tick must not launch another worker');
+            $failureStarted = time();
             $paused=$this->evalWp($worker.'$fault=7;'.$resumeWorker);
+            $failureEnded = time();
         }
         self::assertArrayNotHasKey('autoResumeAt', $paused);
         $tick();
