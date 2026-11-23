@@ -358,6 +358,8 @@ final class LiveHistoryView
             'capture_path_review' => ['対象に含めるファイルと除外するファイルを確認してください。', 'privacy'],
             'capture_unsupported_engine' => ['保守を伴う取得が可能か確認してください。', 'backup'],
             'launch_failed' => ['バックグラウンド実行用のPHPの設定を確認してください。', 'backup'],
+            'auto_resume_waiting' => ['', ''],
+            'auto_resume_exhausted' => ['R2の接続を確認してください。', 'backup'],
             'transfer_connection' => ['R2への接続を確認し、暗号文の転送を再開してください。', 'backup'],
             'schedule_unavailable' => ['接続設定とサーバー側の定期実行設定を確認してください。', 'backup'],
             'schedule_missed' => ['サーバー側の起動状況と次回の予定を確認してください。', 'backup'],

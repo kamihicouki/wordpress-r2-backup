@@ -17,15 +17,27 @@ final class LiveRunner
     public function start(): array { return $this->launch(false); }
     public function startOnline(?array $schedule = null): array { return $this->launch(false, 'online', $schedule); }
     public function resume(): array { return $this->launch(true); }
+    public function resumeScheduled(array $schedule, string $operationId): ?array
+    {
+        $schedule['operationId'] = $operationId;
+        return $this->launch(true, 'maintenance', $schedule);
+    }
+
     public function state(): ?array { return $this->backup->state(); }
 
-    private function launch(bool $resume, string $mode = 'maintenance', ?array $schedule = null): array
+    private function launch(bool $resume, string $mode = 'maintenance', ?array $schedule = null): ?array
     {
-        $workspace = $this->backup->workspace(); $lock = self::runnerLock($workspace, true);
+        $workspace = $this->backup->workspace(); $lock = self::runnerLock($workspace, true, $resume && $schedule !== null);
+        if ($lock === null) { return null; }
         $launchId = bin2hex(random_bytes(32)); $token = bin2hex(random_bytes(32)); $ticket = null; $queued = false;
         try {
-            $php = self::phpBinary();
-            $state = $this->backup->queue($launchId, $resume, $mode, $schedule); $queued = true;
+            $automatic = $resume && $schedule !== null;
+            $php = $automatic ? null : self::phpBinary();
+            $state = $this->backup->queue($launchId, $resume, $mode, $schedule);
+            if ($state === null) { return null; }
+            $queued = true;
+            // After reserving an automatic retry, a missing CLI must also retire that attempt through launchFailed().
+            if ($php === null) { $php = self::phpBinary(); }
             $root = realpath(rtrim(ABSPATH, '/'));
             if ($root === false) { throw new \RuntimeException('WordPressの保存場所を検証できません。'); }
             FileSafety::assertRegularFile($root . '/wp-load.php');
@@ -148,11 +160,16 @@ final class LiveRunner
         catch (\Throwable $error) { $backup->launchFailed($data['launchId']); throw $error; }
     }
 
-    private static function runnerLock(string $workspace, bool $nonblocking)
+    private static function runnerLock(string $workspace, bool $nonblocking, bool $skipBusy = false)
     {
         FileSafety::privateDirectory($workspace); $path = $workspace . '/runner.lock'; FileSafety::assertNoLinks($path);
         $lock = @fopen($path, 'c+b');
-        if ($lock === false || !chmod($path, 0600) || !flock($lock, LOCK_EX | ($nonblocking ? LOCK_NB : 0))) { if (is_resource($lock)) { fclose($lock); } throw new \RuntimeException('バックグラウンド処理が実行中です。'); }
+        $wouldBlock = 0;
+        if ($lock === false || !chmod($path, 0600) || !flock($lock, LOCK_EX | ($nonblocking ? LOCK_NB : 0), $wouldBlock)) {
+            if (is_resource($lock)) { fclose($lock); }
+            if ($skipBusy && $wouldBlock) { return null; }
+            throw new \RuntimeException('バックグラウンド処理が実行中です。');
+        }
         return $lock;
     }
 }

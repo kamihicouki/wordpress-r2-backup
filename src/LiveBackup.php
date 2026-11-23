@@ -7,6 +7,7 @@ final class LiveBackup
     /** Consecutive shared packs one transfer step of a legacy job (no capture guard) reads in full together. */
     private const LEGACY_REUSED_PACK_BATCH = 4;
     private const NEW_PAGE_BATCH = 16;
+    private const SCHEDULED_RETRY_DELAYS = [60, 300, 900];
     private array $settings;
     private string $workspace;
     private DirectR2Repository $repository;
@@ -98,27 +99,58 @@ final class LiveBackup
 
     public function workspace(): string { return $this->workspace; }
 
-    public function queue(string $launchId, bool $resume = false, string $mode = 'maintenance', ?array $schedule = null): array
+    public static function scheduledRetryDue(?array $state, array $schedule, int $now): bool
     {
-        $this->assertReady();
+        $attempts = $state['autoResumeAttempts'] ?? null;
+        $revision = $schedule['revision'] ?? null;
+        return ($schedule['enabled'] ?? false) === true && ($schedule['mode'] ?? null) === 'online'
+            && is_string($revision) && preg_match('/\A[a-f0-9]{64}\z/D', $revision) && ($state['scheduleRevision'] ?? null) === $revision
+            && ($state['status'] ?? null) === 'uploading' && ($state['consistencyMode'] ?? null) === 'online'
+            && is_int($attempts) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])
+            && is_int($state['autoResumeAt'] ?? null) && $state['autoResumeAt'] > 0 && $state['autoResumeAt'] <= $now;
+    }
+
+    public function queue(string $launchId, bool $resume = false, string $mode = 'maintenance', ?array $schedule = null): ?array
+    {
+        $automatic = $resume && $schedule !== null;
+        if (!$automatic) { $this->assertReady(); }
         if (!in_array($mode, ['maintenance', 'online'], true) || ($resume && $mode !== 'maintenance')) { throw new \RuntimeException('取得方式が不正です。'); }
         if (!preg_match('/\A[a-f0-9]{64}\z/D', $launchId)) { throw new \RuntimeException('起動識別子が不正です。'); }
         $lock = $this->lock();
         try {
             $state = $this->operationState();
             if ($resume) {
+                if ($automatic) {
+                    // Recheck under operation.lock after acquiring runner.lock. Cancellation and manual resume can win.
+                    if (!self::scheduledRetryDue($state, $schedule, time()) || $state['id'] !== ($schedule['operationId'] ?? null)) { return null; }
+                    try {
+                        $this->assertReady();
+                        $this->assertBoundSettingsUnchanged($state);
+                    } catch (\RuntimeException $error) {
+                        unset($state['autoResumeAt']);
+                        $this->setState($state);
+                        $this->history->record($state, 'auto_resume_config_changed');
+                        throw $error;
+                    }
+                    ++$state['autoResumeAttempts'];
+                }
                 if (!is_array($state) || $state['status'] !== 'uploading') { throw new \RuntimeException('転送を再開する操作がありません。'); }
+                unset($state['autoResumeAt']);
                 $state['resumeStatus'] = 'uploading';
             } else {
                 if (is_array($state) && !in_array($state['status'], ['complete', 'failed', 'cancelled'], true)) { throw new \RuntimeException('未完了のバックアップがあります。転送を再開してください。'); }
                 if (@lstat(rtrim(ABSPATH, '/') . '/.maintenance') !== false) { throw new \RuntimeException('保守状態が残っています。未完了の実行を取り消してから取得してください。'); }
                 $state = ['id' => bin2hex(random_bytes(32)), 'snapshotId' => bin2hex(random_bytes(32)), 'completed' => 0, 'total' => 0, 'startedAt' => gmdate('Y-m-d\TH:i:s\Z')];
+                if ($mode === 'online' && isset($schedule['revision'])) {
+                    $state['scheduleRevision'] = $schedule['revision'];
+                    $state['autoResumeAttempts'] = 0;
+                }
                 $state['consistencyMode'] = $mode; $state['settingsDigest'] = $this->fullSettingsDigest($this->settings); $state['sharingDigest'] = $this->sharingDigest();
                 $this->assertBoundSettingsUnchanged($state);
             }
             $state['status'] = 'queued'; $state['launchId'] = $launchId; $state['message'] = 'バックグラウンド処理の開始を待っています。';
             $this->setState($state);
-            if ($resume) { $this->history->record($state, 'resume_queued'); }
+            if ($resume) { $this->history->record($state, $automatic ? 'auto_resume_queued' : 'resume_queued'); }
             else { $this->history->start($state, $this->settings, $mode, $schedule); }
             return $state;
         } finally { flock($lock, LOCK_UN); fclose($lock); }
@@ -162,13 +194,16 @@ final class LiveBackup
 
     public function launchFailed(string $launchId): void
     {
-        $state = $this->operationState();
-        if (is_array($state) && $state['status'] === 'queued' && ($state['launchId'] ?? '') === $launchId) {
-            $state['status'] = ($state['resumeStatus'] ?? '') === 'uploading' ? 'uploading' : 'failed';
-            $state['message'] = 'バックグラウンド処理を開始できませんでした。PHP CLIの設定を確認してください。';
-            $this->setState($state);
-            $this->history->launchFailure($state);
-        }
+        $lock = self::lockWorkspace($this->workspace, true);
+        try {
+            $state = $this->operationState();
+            if (is_array($state) && $state['status'] === 'queued' && ($state['launchId'] ?? '') === $launchId) {
+                $state['status'] = ($state['resumeStatus'] ?? '') === 'uploading' ? 'uploading' : 'failed';
+                $state['message'] = 'バックグラウンド処理を開始できませんでした。PHP CLIの設定を確認してください。';
+                $this->setState($state);
+                $this->history->launchFailure($state);
+            }
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
     }
 
     private function assertReady(): void
@@ -230,6 +265,10 @@ final class LiveBackup
             $state = ['id' => $id, 'snapshotId' => $queued ? $existing['snapshotId'] : bin2hex(random_bytes(32)), 'status' => 'capturing', 'completed' => 0, 'total' => 0, 'startedAt' => gmdate('Y-m-d\TH:i:s\Z'),
                 'captureGuard' => bin2hex(random_bytes(16)),
                 'message' => 'ファイルとデータベースを取得しています。'];
+            if (isset($binding['scheduleRevision'])) {
+                $state['scheduleRevision'] = $binding['scheduleRevision'];
+                $state['autoResumeAttempts'] = $binding['autoResumeAttempts'];
+            }
             if ($mode === 'maintenance') { $state['maintenanceOwner'] = $owner; }
             $state['consistencyMode'] = $mode; $state['settingsDigest'] = $binding['settingsDigest']; $state['sharingDigest'] = $binding['sharingDigest'];
             $this->setState($state);
@@ -364,9 +403,31 @@ final class LiveBackup
             return $job['state'];
         } catch (\Throwable $error) {
             $this->historyUploadRun = null;
-            if (($state['status'] ?? null) === 'uploading') { $this->history->record($state, BackupHistory::transferError($error)); }
+            if (($state['status'] ?? null) === 'uploading') {
+                $this->recordTransferFailure($state, $error);
+            }
             throw $error;
         } finally { flock($lock, LOCK_UN); fclose($lock); }
+    }
+
+    private function recordTransferFailure(array $state, \Throwable $error): void
+    {
+        $code = BackupHistory::transferError($error);
+        // A completed job or a newer checkpoint must never be rolled back by the failure handler.
+        $current = isset($state['scheduleRevision']) ? $this->operationState() : null;
+        if (($current['status'] ?? null) === 'uploading' && $current['id'] === $state['id']) {
+            $before = $current['autoResumeAt'] ?? null;
+            unset($current['autoResumeAt']);
+            if ($error instanceof R2TransportException && $error->isTransient()) {
+                $attempts = $current['autoResumeAttempts'] ?? null;
+                if (is_int($attempts) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])) {
+                    $current['autoResumeAt'] = time() + self::SCHEDULED_RETRY_DELAYS[$attempts];
+                    $code = 'auto_resume_waiting';
+                } elseif ($attempts === count(self::SCHEDULED_RETRY_DELAYS)) { $code = 'auto_resume_exhausted'; }
+            }
+            if (($current['autoResumeAt'] ?? null) !== $before) { $this->setState($current); }
+        }
+        $this->history->record($state, $code);
     }
 
     private function v4Scope(): array
@@ -420,6 +481,10 @@ final class LiveBackup
         $this->validateV4Job($job, $directory);
         if (($job['state']['id'] ?? null) !== $state['id'] || ($job['state']['snapshotId'] ?? null) !== $state['snapshotId']) {
             throw new \RuntimeException('v4バックアップの実行状態が一致しません。');
+        }
+        // Progress checkpoints replace the operation option. Carry its retry budget across successful steps.
+        if (isset($state['scheduleRevision'])) {
+            $job['state']['autoResumeAttempts'] = $state['autoResumeAttempts'];
         }
         if (($job['state']['status'] ?? '') === 'complete' && $job['position'] === count($job['objects']) + 1) {
             $this->history->record($state, 'final_verification');
@@ -838,12 +903,12 @@ final class LiveBackup
         finally { flock($lock, LOCK_UN); fclose($lock); }
     }
 
-    private static function lockWorkspace(string $workspace)
+    private static function lockWorkspace(string $workspace, bool $wait = false)
     {
         $path = $workspace . '/operation.lock';
         FileSafety::assertNoLinks($path);
         $lock = fopen($path, 'c+b');
-        if (!$lock || !chmod($path, 0600) || !flock($lock, LOCK_EX | LOCK_NB)) { if (is_resource($lock)) { fclose($lock); } throw new \RuntimeException('別のバックアップ処理が実行中です。'); }
+        if (!$lock || !chmod($path, 0600) || !flock($lock, LOCK_EX | ($wait ? 0 : LOCK_NB))) { if (is_resource($lock)) { fclose($lock); } throw new \RuntimeException('別のバックアップ処理が実行中です。'); }
         return $lock;
     }
 
