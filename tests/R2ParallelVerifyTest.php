@@ -19,7 +19,7 @@ final class R2ParallelVerifyTest extends TestCase
 
     public function scenarios(): array
     {
-        $names = ['success', 'retry', 'tls', 'corrupt', 'length', 'overflow', 'status', 'throttled', 'server', 'missing', 'budget', 'exhausted', 'staggered', 'boundary15', 'boundary16'];
+        $names = ['success', 'retry', 'tls', 'corrupt', 'length', 'overflow', 'status', 'throttled', 'server', 'retry_then_denied', 'missing', 'budget', 'exhausted', 'staggered', 'boundary15', 'boundary16'];
         return array_combine($names, array_map(static fn (string $name): array => [$name], $names));
     }
 }

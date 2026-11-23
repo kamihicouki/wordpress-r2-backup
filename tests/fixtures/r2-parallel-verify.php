@@ -31,7 +31,7 @@ namespace WordPressR2Backup {
 
 namespace {
     require dirname(__DIR__, 2) . '/vendor/autoload.php';
-    use WordPressR2Backup\{DirectR2Repository, R2TransportException};
+    use WordPressR2Backup\{DirectR2Repository, R2HttpException, R2TransportException};
 
     function check(bool $condition, string $message): void { if (!$condition) { throw new RuntimeException($message); } }
 
@@ -109,6 +109,7 @@ namespace {
         'status' => ['GET ' . $third => [['status' => 403]]],
         'throttled' => ['GET ' . $third => [['status' => 429]]],
         'server' => ['GET ' . $third => [['status' => 503]]],
+        'retry_then_denied' => ['HEAD ' . $fifth => [['errno' => 7]], 'HEAD ' . $third => [['status' => 403]]],
         'missing' => ['HEAD ' . $third => [['status' => 404]]],
         'budget' => ['GET ' . $third => [['errno' => 56, 'advance' => 181]]],
         'exhausted' => ['GET ' . $third => [['errno' => 56], ['errno' => 56], ['errno' => 56], ['errno' => 56]]],
@@ -136,7 +137,14 @@ namespace {
     $failure = null;
     try { $repository->publishWithObjects($snapshot, $manifest, $receipts); }
     catch (\Throwable $error) { $failure = $error; }
+    $safeLog = is_file(ini_get('error_log')) ? file_get_contents(ini_get('error_log')) : '';
     @unlink(ini_get('error_log'));
+    if ($scenario === 'retry_then_denied') {
+        check(strpos($safeLog, 'kind=connection errno=7 attempt=1/4 retry=yes') !== false, 'The first transfer was retryable');
+        check(strpos($safeLog, 'method=HEAD reason=http_status status=403') !== false, 'The final rejection must be distinguishable');
+        check($failure instanceof R2HttpException && $failure->retryNotBefore() === null, 'The earlier error must not authorize a retry');
+    }
+
     $commit = 'commits/' . $snapshot . '.json';
     // No attempt may start before its previous failure plus the retry delay, measured on the monotonic time.
     foreach ($GLOBALS['r2']['failures'] as $name => $failed) {
@@ -179,10 +187,11 @@ namespace {
             'corrupt' => [RuntimeException::class, 'Ciphertext verification failed.'],
             'length' => [RuntimeException::class, 'Stored ciphertext length does not match.'],
             'overflow' => [R2TransportException::class, 'R2 transport failed (overflow, errno 23, attempt 1 of 4).'],
-            'status' => [RuntimeException::class, 'R2 request failed or exceeded its response limit.'],
-            'throttled' => [RuntimeException::class, 'R2 request failed or exceeded its response limit.'],
-            'server' => [RuntimeException::class, 'R2 request failed or exceeded its response limit.'],
-            'missing' => [RuntimeException::class, 'R2 request failed or exceeded its response limit.'],
+            'status' => [R2HttpException::class, 'R2 returned HTTP 403.'],
+            'throttled' => [R2HttpException::class, 'R2 returned HTTP 429.'],
+            'server' => [R2HttpException::class, 'R2 returned HTTP 503.'],
+            'missing' => [R2HttpException::class, 'R2 returned HTTP 404.'],
+            'retry_then_denied' => [R2HttpException::class, 'R2 returned HTTP 403.'],
             'budget' => [R2TransportException::class, 'R2 transport failed (connection, errno 56, attempt 1 of 4).'],
             'exhausted' => [R2TransportException::class, 'R2 transport failed (connection, errno 56, attempt 4 of 4).'],
         ][$scenario];

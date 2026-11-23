@@ -123,6 +123,7 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $worker = 'require '.var_export(__DIR__.'/MemoryR2Transport.php', true).';'
             .'$fault=0; $s=WordPressR2Backup\LiveSettings::load(); $memory=new WordPressR2Backup\Tests\MemoryR2Transport('.var_export($objects,true).');'
             .'$transport=static function(array $request, callable $consume) use ($memory,&$fault){'
+            .'if($fault===503 && $request["method"]==="PUT") return ["status"=>503,"headers"=>["Retry-After"=>"600"]];'
             .'if($fault && $request["method"]==="PUT") throw new WordPressR2Backup\R2TransportException($fault);'
             .'return $memory($request,$consume);};'
             .'$b=new WordPressR2Backup\LiveBackup($s,new WordPressR2Backup\DirectR2Repository(array_intersect_key($s,array_flip(["accountId","bucket","accessKeyId","secretAccessKey","unitId"])),$transport));'
@@ -210,7 +211,10 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertSame('queued',$second['status']);
         self::assertNotSame($initial['id'],$second['id']);
         $this->evalWp($worker.'$b->begin($a["launchId"]); echo json_encode($b->step());');
-        $this->evalWp($worker.$fault);
+        $temporary=$this->evalWp($worker.str_replace(['$fault=7;', 'R2TransportException $error'], ['$fault=503;', 'R2HttpException $error'], $fault));
+        self::assertEqualsWithDelta(time()+600, $temporary['autoResumeAt'], 5);
+        $tick();
+        self::assertSame($temporary,$read(), 'Retry-After must survive a new scheduler process');
         $dueNow();
         $tick();
         $recovered=$this->evalWp($worker.'$fault=0;'.$resumeWorker);
@@ -219,6 +223,9 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertSame(1,$recovered['autoResumeAttempts']);
         $history=$this->evalWp('echo json_encode((new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->find('.var_export($second['id'],true).'));');
         $codes=array_column($history['events'],'code');
+        $waiting = $history['events'][array_search('auto_resume_waiting',$codes,true)];
+        self::assertSame(503,$waiting['httpStatus']);
+        self::assertStringContainsString('HTTP 503',$waiting['message']);
         self::assertContains('final_verification',$codes);
         self::assertSame('complete',end($codes));
     }

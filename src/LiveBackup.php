@@ -418,16 +418,17 @@ final class LiveBackup
         if (($current['status'] ?? null) === 'uploading' && $current['id'] === $state['id']) {
             $before = $current['autoResumeAt'] ?? null;
             unset($current['autoResumeAt']);
-            if ($error instanceof R2TransportException && $error->isTransient()) {
+            $notBefore = $error instanceof R2HttpException ? $error->retryNotBefore() : null;
+            if (($error instanceof R2TransportException && $error->isTransient()) || $notBefore !== null) {
                 $attempts = $current['autoResumeAttempts'] ?? null;
                 if (is_int($attempts) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])) {
-                    $current['autoResumeAt'] = time() + self::SCHEDULED_RETRY_DELAYS[$attempts];
+                    $current['autoResumeAt'] = max($notBefore ?? 0, time() + self::SCHEDULED_RETRY_DELAYS[$attempts]);
                     $code = 'auto_resume_waiting';
                 } elseif ($attempts === count(self::SCHEDULED_RETRY_DELAYS)) { $code = 'auto_resume_exhausted'; }
             }
             if (($current['autoResumeAt'] ?? null) !== $before) { $this->setState($current); }
         }
-        $this->history->record($state, $code);
+        $this->history->record($state, $code, null, $error instanceof R2HttpException ? $error->getCode() : null);
     }
 
     private function v4Scope(): array

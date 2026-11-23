@@ -19,9 +19,9 @@ final class BackupHistory
         'queued' => ['queued', 'バックアップの起動を待っています。'],
         'resume_queued' => ['queued', '転送の再開を待っています。'],
         'auto_resume_config_changed' => ['interrupted', '取得時の設定または接続・復号の確認状態が変わったため、自動再開を停止しました。取得時の設定を確認してください。'],
-        'auto_resume_waiting' => ['interrupted', 'R2への接続が途切れました。保存済みの位置からの自動再開を待っています。'],
-        'auto_resume_queued' => ['queued', '一時的なR2接続エラーのため、保存済みの位置から転送を自動再開します。'],
-        'auto_resume_exhausted' => ['interrupted', 'R2接続エラーが続き、自動再開が上限の3回に達しました。接続を確認して「転送を再開」を実行してください。'],
+        'auto_resume_waiting' => ['interrupted', 'R2の一時エラーにより転送が中断しました。保存済みの位置からの自動再開を待っています。'],
+        'auto_resume_queued' => ['queued', 'R2の一時エラーのため、保存済みの位置から転送を自動再開します。'],
+        'auto_resume_exhausted' => ['interrupted', 'R2の一時エラーが続き、自動再開が上限の3回に達しました。接続を確認して「転送を再開」を実行してください。'],
         'capture_started' => ['capturing', 'ファイルとデータベースの取得を開始しました。'],
         'upload_started' => ['uploading', '取得と暗号化が完了し、R2への転送を開始しました。'],
         'resumed' => ['uploading', '保存済みの位置から転送を再開しました。'],
@@ -80,6 +80,8 @@ final class BackupHistory
             $detail = $event['retry'] ?? null;
             if (is_string($detail) && (self::RETRY_EVENTS[$detail] ?? null) === $event['code']) { $event['code'] = $detail; }
             $event['message'] = self::EVENTS[$event['code']][1];
+            $status = $event['httpStatus'] ?? null;
+            if (is_int($status) && $status >= 100 && $status <= 599) { $event['message'] .= '（HTTP ' . $status . '）'; }
         }
         unset($event);
         return $run;
@@ -118,11 +120,11 @@ final class BackupHistory
         });
     }
 
-    public function record(array $state, string $code, ?int $bytes = null): void
+    public function record(array $state, string $code, ?int $bytes = null, ?int $httpStatus = null): void
     {
         $id = $state['id'] ?? null;
         if (!self::isId($id) || !isset(self::EVENTS[$code]) || str_starts_with($code, 'schedule_')) { return; }
-        $this->change(static function (array &$runs) use ($state, $code, $bytes, $id): bool {
+        $this->change(static function (array &$runs) use ($state, $code, $bytes, $id, $httpStatus): bool {
             $index = self::index($runs, $id);
             $run = $index === null ? self::newRun($id, $state, 'unknown', null) : $runs[$index];
             if ($run['status'] === 'cancelled' || ($run['status'] === 'complete' && $code !== 'retention_failed')) { return false; }
@@ -130,7 +132,7 @@ final class BackupHistory
                 && ($run['status'] !== 'queued' || ($run['_launchId'] ?? null) !== ($state['launchId'] ?? null))) { return false; }
             if ($code === 'resumed' && $run['status'] !== 'queued' && $run['status'] !== 'interrupted' && $index !== null) { return false; }
             $event = $code === 'cancelled' && $run['status'] === 'failed' ? 'failed_cleanup' : $code;
-            if (!self::apply($run, $state, $event, $bytes)) { return false; }
+            if (!self::apply($run, $state, $event, $bytes, $httpStatus)) { return false; }
             if ($index !== null) { array_splice($runs, $index, 1); }
             array_unshift($runs, $run);
             return true;
@@ -265,16 +267,18 @@ final class BackupHistory
             'settings' => $settings, 'events' => []];
     }
 
-    private static function apply(array &$run, array $state, string $code, ?int $bytes): bool
+    private static function apply(array &$run, array $state, string $code, ?int $bytes, ?int $httpStatus = null): bool
     {
         $at = self::now();
         $status = self::EVENTS[$code][0];
         $last = end($run['events']);
         $storedCode = self::RETRY_EVENTS[$code] ?? $code;
-        if ($last !== false && $last['code'] === $storedCode && ($last['retry'] ?? $storedCode) === $code
+        if ($httpStatus !== null && ($httpStatus < 100 || $httpStatus > 599)) { $httpStatus = null; }
+        if ($last !== false && ($last['httpStatus'] ?? null) === $httpStatus && $last['code'] === $storedCode && ($last['retry'] ?? $storedCode) === $code
             && (!self::isId($state['launchId'] ?? null) || ($run['_launchId'] ?? null) === $state['launchId'])) { return false; }
         $event = ['at' => $at, 'code' => $storedCode];
         if ($storedCode !== $code) { $event['retry'] = $code; }
+        if ($httpStatus !== null) { $event['httpStatus'] = $httpStatus; }
         $run['events'][] = $event;
         if (count($run['events']) > self::MAX_EVENTS) { array_splice($run['events'], 1, 1); }
         $run['status'] = $status; $run['updatedAt'] = $at;

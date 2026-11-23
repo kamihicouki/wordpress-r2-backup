@@ -588,7 +588,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
             error_log(sprintf('wrb-r2-transport method=%s errno=none local=yes', $method));
             throw new RuntimeException('R2 transport failed.');
         }
-        return self::accepted($prepared['flags'], $response, $allowed);
+        return self::accepted($method, $prepared['flags'], $response, $allowed);
     }
 
     /** Signs one attempt now and bounds what its response may deliver. */
@@ -637,16 +637,33 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         return $failure;
     }
 
-    private static function accepted(\stdClass $flags, $response, array $allowed): array
+    private static function accepted(string $method, \stdClass $flags, $response, array $allowed): array
     {
-        if ($flags->overflow || $flags->refused || !is_array($response) || !is_int($response['status'] ?? null) || !in_array($response['status'], $allowed, true)
-            || !is_array($response['headers'] ?? null)) { throw new RuntimeException('R2 request failed or exceeded its response limit.'); }
+        $status = is_array($response) ? ($response['status'] ?? null) : null;
+        $validStatus = is_int($status) && $status >= 100 && $status <= 599;
+        $reason = null;
+        if ($flags->overflow) { $reason = 'response_limit'; }
+        elseif ($flags->refused) { $reason = 'local_refusal'; }
+        elseif (!$validStatus || !is_array($response['headers'] ?? null)) { $reason = 'invalid_response'; }
+        if ($reason !== null) {
+            error_log(sprintf('wrb-r2-response method=%s reason=%s status=%d', $method, $reason, $validStatus ? $status : 0));
+            throw new RuntimeException('R2 request failed or exceeded its response limit.');
+        }
         $normalized = [];
         foreach ($response['headers'] as $name => $value) {
-            if (!is_string($name) || !is_string($value)) { throw new RuntimeException('Invalid R2 response headers.'); }
-            $normalized[strtolower($name)] = trim($value);
+            if (!is_string($name) || !is_string($value)) {
+                error_log(sprintf('wrb-r2-response method=%s reason=invalid_headers status=%d', $method, $status));
+                throw new RuntimeException('Invalid R2 response headers.');
+            }
+            $name = strtolower($name);
+            if ($name === 'retry-after' && isset($normalized[$name])) { $normalized[$name] = ''; }
+            else { $normalized[$name] = trim($value); }
         }
-        return ['status' => $response['status'], 'headers' => $normalized];
+        if (!in_array($status, $allowed, true)) {
+            error_log(sprintf('wrb-r2-response method=%s reason=http_status status=%d', $method, $status));
+            throw new R2HttpException($status, $normalized['retry-after'] ?? null);
+        }
+        return ['status' => $status, 'headers' => $normalized];
     }
 
     private function curl(array $request, callable $consume): array
@@ -730,7 +747,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
                     self::releaseHandle($entry['handle']); $free[] = $entry['handle'];
                     $index = $entry['index'];
                     if ((int) $done['result'] === 0) {
-                        $results[$index] = self::accepted($entry['flags'], ['status' => $status, 'headers' => $entry['received']->headers], $specs[$index]['allowed']);
+                        $results[$index] = self::accepted($method, $entry['flags'], ['status' => $status, 'headers' => $entry['received']->headers], $specs[$index]['allowed']);
                         continue;
                     }
                     $failure = self::stoppedHere($entry['flags'], new R2TransportException((int) $done['result']));
@@ -772,7 +789,8 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
                 elseif (strpos($line, ':') !== false) {
                     [$name, $value] = explode(':', $line, 2); $name = strtolower(trim($name));
                     if (isset($received->headers[$name]) && $name === 'content-length') { return 0; }
-                    $received->headers[$name] = trim($value);
+                    if ($name === 'retry-after' && isset($received->headers[$name])) { $received->headers[$name] = ''; }
+                    else { $received->headers[$name] = trim($value); }
                 }
                 return $length;
             }];
