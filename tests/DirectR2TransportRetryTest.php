@@ -4,6 +4,7 @@ namespace WordPressR2Backup\Tests;
 
 use PHPUnit\Framework\TestCase;
 use WordPressR2Backup\DirectR2Repository;
+use WordPressR2Backup\R2HttpException;
 use WordPressR2Backup\R2TransportException;
 
 /** Faults at the real class's transport seam, and real cURL against a local TLS server. No network beyond loopback. */
@@ -212,6 +213,52 @@ final class DirectR2TransportRetryTest extends TestCase
         try { $repository->verify($this->receipt); self::fail('Expected failure.'); }
         catch (R2TransportException $error) { self::assertSame('R2 transport failed (connection, errno 28, attempt 2 of 4).', $error->getMessage()); }
         self::assertSame(['HEAD', 'HEAD'], $this->methods());
+    }
+
+    public function testOnlyExplicitTemporaryHttpResponsesCanResumeTheScheduledTransfer(): void
+    {
+        $time = time() + 7200;
+        $date = gmdate('D, d M Y H:i:s', $time) . ' GMT';
+        foreach ([[429, null, 0], [503, $date, $time], [403, '0', null], [404, null, null],
+            [500, null, null], [503, 'not a date', null], [429, '99999999999999999999', null]] as [$status, $header, $expected]) {
+            $httpHeaders = $header === null ? [] : ['Retry-After' => $header];
+            try {
+                $this->repository(static fn (): array => ['status' => $status, 'headers' => $httpHeaders])->verify($this->receipt);
+                self::fail('Unexpected HTTP status accepted');
+            } catch (R2HttpException $error) {
+                self::assertSame($expected, $error->retryNotBefore());
+                self::assertSame($status, $error->getCode());
+                self::assertNull($error->getPrevious());
+            }
+        }
+        self::assertEqualsWithDelta(time()+600, (new R2HttpException(429, '00600'))->retryNotBefore(), 1);
+        self::assertSame([], $this->waits, 'No immediate HTTP request replay');
+        $log = file_get_contents($this->logFile);
+        self::assertStringContainsString('method=HEAD reason=http_status status=429', $log);
+        foreach ([$this->receipt['key'], $this->connection['accountId'], $this->connection['secretAccessKey'], 'not a date'] as $value) {
+            self::assertStringNotContainsString($value, $log);
+        }
+    }
+
+    public function testTemporaryStatusCannotHideInvalidResponseOrLocalRefusal(): void
+    {
+        foreach (['response_limit','invalid_headers','ambiguous_retry_after'] as $case) {
+            $repository = $this->repository(static function (int $n, string $method, callable $consume) use ($case): array {
+                $headers = [];
+                if ($case === 'response_limit') { $consume('a HEAD cannot have a body'); }
+                if ($case === 'invalid_headers') { $headers['broken'] = ['invalid']; }
+                if ($case === 'ambiguous_retry_after') { $headers = ['Retry-After'=>'900','retry-after'=>'0']; }
+                return ['status'=>503,'headers'=>$headers];
+            });
+            try { $repository->verify($this->receipt); self::fail('Invalid response accepted'); }
+            catch (\RuntimeException $error) {
+                if ($case === 'ambiguous_retry_after') {
+                    self::assertInstanceOf(R2HttpException::class,$error);
+                    self::assertNull($error->retryNotBefore());
+                } else { self::assertNotInstanceOf(R2HttpException::class,$error); }
+            }
+        }
+        self::assertSame([], $this->waits);
     }
 
     public function testAClockGoingBackwardsStopsRetrying(): void
