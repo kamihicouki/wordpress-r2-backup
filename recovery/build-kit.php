@@ -91,6 +91,10 @@ try {
     $output = $candidate;
     $plugin = dirname(__DIR__);
     $stage = '復旧処理と形式仕様の同梱';
+    $header = file_get_contents($plugin . '/wordpress-r2-backup.php', false, null, 0, 8192);
+    if (!is_string($header) || preg_match('/^ \* Version: ([0-9]+\.[0-9]+\.[0-9]+)\r?$/m', $header, $version) !== 1) {
+        throw new RuntimeException('The plugin release version is unavailable.');
+    }
     mkdir($output . '/library', 0700);
     foreach (['composer.json', 'composer.lock', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'src', 'dependencies', 'assets', 'local-router.php', 'restore-worker.php'] as $entry) { wrbCopyTree($plugin . '/' . $entry, $output . '/library/' . $entry); }
     wrbCopyTree(__DIR__ . '/recover.php', $output . '/recover.php');
@@ -116,9 +120,11 @@ try {
         'PATH' => dirname(PHP_BINARY) . ':/usr/bin:/bin',
         'COMPOSER_HOME' => $output . '/.composer-home',
         'COMPOSER_CACHE_DIR' => $output . '/.composer-cache',
+        'COMPOSER_ROOT_VERSION' => $version[1],
     ]);
     foreach (['.composer-home', '.composer-cache'] as $entry) { if (is_dir($output . '/' . $entry)) { wrbRemoveOwned($output . '/' . $entry); } }
     $dependencies = [
+        'releaseVersion' => $version[1],
         'readableManifestVersions' => [1, 2, 3, 4],
         'ageVersion' => '1.3.2', 'packagedPlatform' => 'darwin-arm64',
         'archiveSha256' => $sha256,

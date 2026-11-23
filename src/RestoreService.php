@@ -166,17 +166,37 @@ final class RestoreService
         if (!is_file($job . '/status.json')) { throw new RestoreError('指定の復元が見つかりません。'); }
         $status = $this->readJson($job . '/status.json');
         if ($status === null) { throw new RestoreError('復元の状態を読み取れません。'); }
-        if (in_array($status['state'], ['queued', 'running'], true) && !$this->held($job . '/worker.lock') && (time() - ($status['startedAt'] ?? 0) > 20 || $status['state'] === 'running')) {
+        if (self::possiblyInterrupted($status)) { $status = $this->resolveWorkerStatus($job, $status); }
+        $status['site'] = $this->siteStatus($job, $status);
+        $status['phaseLabel'] = self::phaseLabel((string) ($status['phase'] ?? ''));
+        return $status;
+    }
+
+    private static function possiblyInterrupted(array $status): bool
+    {
+        return $status['state'] === 'running' || ($status['state'] === 'queued' && time() - ($status['startedAt'] ?? 0) > 20);
+    }
+
+    private function resolveWorkerStatus(string $job, array $observed): array
+    {
+        $path = $job . '/worker.lock';
+        FileSafety::assertNoLinks($path);
+        $lock = @fopen($path, 'c+b');
+        if ($lock === false) { throw new RestoreError('復元処理の状態を確認できません。'); }
+        try {
+            // A worker can publish its final state after the first read and before releasing its exclusive lock.
+            if (!flock($lock, LOCK_SH | LOCK_NB)) { return $observed; }
+            $status = $this->readJson($job . '/status.json');
+            if ($status === null) { throw new RestoreError('復元の状態を読み取れません。'); }
+            if (!self::possiblyInterrupted($status)) { return $status; }
             $requested = is_file($job . '/stop-requested');
             $this->removeCredentials($job);
             $current = self::failCurrent($status['results'] ?? []);
             $status = array_merge($status, ['state' => $requested ? 'stopped' : 'interrupted', 'results' => $current, 'updatedAt' => time(),
                 'message' => $requested ? '依頼により処理を停止しました。' : '処理が途中で終了しました。同じデータベースへは再取込しません。新しい名前と新しいデータベースでやり直してください。']);
             $this->writeJson($job . '/status.json', $status);
-        }
-        $status['site'] = $this->siteStatus($job, $status);
-        $status['phaseLabel'] = self::phaseLabel((string) ($status['phase'] ?? ''));
-        return $status;
+            return $status;
+        } finally { fclose($lock); }
     }
 
     public function stop(string $name): array
