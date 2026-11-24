@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WordPress R2 Backup
  * Description: このWordPressのファイルとデータベースを公開鍵で暗号化し、Cloudflare R2へバックアップします。
- * Version: 0.7.0
+ * Version: 0.7.1
  * Requires PHP: 7.4
  * License: GPL-2.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
