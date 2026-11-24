@@ -10,12 +10,18 @@ final class BackupHistory
     private const MAX_BYTES = 3145728;
     // Preserve the journal format understood by earlier releases. Retry details refine existing events.
     private const RETRY_EVENTS = [
+        'legacy_http_retry' => 'transfer_connection',
+        'worker_lost_waiting' => 'transfer_connection',
+        'scheduled_released' => 'transfer_failed',
         'auto_resume_config_changed' => 'transfer_failed',
         'auto_resume_waiting' => 'transfer_connection',
         'auto_resume_exhausted' => 'transfer_connection',
         'auto_resume_queued' => 'resume_queued',
     ];
     private const EVENTS = [
+        'legacy_http_retry' => ['interrupted', '旧版で中断した暗号文転送の保存位置を検証しました。同じ世代を一度だけ自動再開します。'],
+        'worker_lost_waiting' => ['interrupted', '実行ワーカーの停止を検出しました。検証済みの保存位置から同じ転送を自動再開します。'],
+        'scheduled_released' => ['interrupted', '前回の定期実行を未完了として保管し、次の予定枠を解放しました。作業ファイルは元の場所に保持しています。'],
         'queued' => ['queued', 'バックアップの起動を待っています。'],
         'resume_queued' => ['queued', '転送の再開を待っています。'],
         'auto_resume_config_changed' => ['interrupted', '取得時の設定または接続・復号の確認状態が変わったため、自動再開を停止しました。取得時の設定を確認してください。'],
@@ -127,6 +133,11 @@ final class BackupHistory
         $this->change(static function (array &$runs) use ($state, $code, $bytes, $id, $httpStatus): bool {
             $index = self::index($runs, $id);
             $run = $index === null ? self::newRun($id, $state, 'unknown', null) : $runs[$index];
+            if ($index === null && $code === 'scheduled_released' && self::isTime($state['scheduledSlot'] ?? null) && self::isId($state['scheduleRevision'] ?? null)) {
+                $run['source'] = 'scheduled';
+                $run['scheduledAt'] = $state['scheduledSlot'];
+                $run['schedule'] = ['slot' => $state['scheduledSlot'], 'revision' => $state['scheduleRevision']];
+            }
             if ($run['status'] === 'cancelled' || ($run['status'] === 'complete' && $code !== 'retention_failed')) { return false; }
             if (in_array($code, ['launch_failed', 'resume_failed'], true) && $index !== null
                 && ($run['status'] !== 'queued' || ($run['_launchId'] ?? null) !== ($state['launchId'] ?? null))) { return false; }
