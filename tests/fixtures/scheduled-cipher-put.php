@@ -16,6 +16,8 @@ $transport = static function (array $request, callable $consume) use ($storage,$
     if ($fault !== 'healthy' && $method === 'PUT' && str_ends_with($path,'.age')) {
         if (($request['headers']['if-none-match'] ?? null) !== '*') { throw new LogicException('Missing conditional header'); }
         file_put_contents($marker,$path);
+        if ($fault === 'terminated') { exit(77); } // Simulate loss before an HTTP response or exception is recorded.
+        if ($fault === 'forbidden') { return ['status'=>403,'headers'=>[]]; }
         if ($fault !== 'persistent') {
             if ($storage($request,$consume)['status'] !== 200) { throw new LogicException('Expected a new synthetic object'); }
             if ($fault === 'corrupt') {

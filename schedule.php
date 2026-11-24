@@ -52,6 +52,28 @@ try {
             wp_cache_delete('wrb_live_schedule_runner', 'options'); wp_cache_delete('notoptions', 'options');
             if (get_option('wrb_live_schedule_runner', null) !== $value) { throw new RuntimeException('Schedule state could not be recorded.'); }
         };
+        // Only detached scheduled operations without a retry deadline need reconciliation.
+        if (($config['enabled'] ?? false) === true && ($config['mode'] ?? '') === 'online') {
+            wp_cache_delete('wrb_live_operation', 'options');
+            $active = get_option('wrb_live_operation', null);
+            $unfinished = isset($active['scheduleRevision']) && (!isset($active['autoResumeAt']) || $slot !== null)
+                && in_array($active['status'] ?? '', ['queued', 'capturing', 'uploading'], true);
+            // Look for a retained workspace only on idle ticks, outside a due slot and pending retry.
+            $cleanup = $slot === null && !in_array($active['status'] ?? '', ['queued', 'capturing', 'uploading'], true)
+                && (bool) glob($workspace . '/job-*/interrupted-operation.json', GLOB_NOSORT);
+            if ($unfinished || $cleanup) {
+                try {
+                    \WordPressR2Backup\BackupScheduler::assertOnlineRelease(__DIR__);
+                    $currentSettings = \WordPressR2Backup\LiveSettings::load();
+                    if (is_array($currentSettings)) {
+                        (new \WordPressR2Backup\LiveRunner($currentSettings))->reconcileScheduled($config, $slot, $now->getTimestamp());
+                    }
+                } catch (Throwable $error) {
+                    // Leave the existing operation in place. The regular slot path records busy/unavailable.
+                    fwrite(STDERR, "中断した定期実行を確認できませんでした。\n");
+                }
+            }
+        }
         if ($slot !== null) {
             $settings = null;
             // Claim before any future launch. A crash may miss one slot, but cannot replay it.

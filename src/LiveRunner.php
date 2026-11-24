@@ -23,6 +23,17 @@ final class LiveRunner
         return $this->launch(true, 'maintenance', $schedule);
     }
 
+    public function reconcileScheduled(array $schedule, ?string $slot, int $now): void
+    {
+        $lock = self::runnerLock($this->backup->workspace(), true, true);
+        if ($lock === null) { return; }
+        try {
+            $this->backup->reconcileScheduled($schedule, $slot, $now);
+            if ($slot === null) { $this->backup->pruneExpiredScheduledWork($now); }
+        }
+        finally { flock($lock, LOCK_UN); fclose($lock); }
+    }
+
     public function state(): ?array { return $this->backup->state(); }
 
     private function launch(bool $resume, string $mode = 'maintenance', ?array $schedule = null): ?array

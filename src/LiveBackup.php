@@ -105,9 +105,125 @@ final class LiveBackup
         $revision = $schedule['revision'] ?? null;
         return ($schedule['enabled'] ?? false) === true && ($schedule['mode'] ?? null) === 'online'
             && is_string($revision) && preg_match('/\A[a-f0-9]{64}\z/D', $revision) && ($state['scheduleRevision'] ?? null) === $revision
-            && ($state['status'] ?? null) === 'uploading' && ($state['consistencyMode'] ?? null) === 'online'
+            && empty($state['manualResume']) && ($state['status'] ?? null) === 'uploading' && ($state['consistencyMode'] ?? null) === 'online'
             && is_int($attempts) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])
             && is_int($state['autoResumeAt'] ?? null) && $state['autoResumeAt'] > 0 && $state['autoResumeAt'] <= $now;
+    }
+
+    /** Called while the scheduler owns runner.lock. A live worker owns that lock for its entire lifetime. */
+    public function reconcileScheduled(array $schedule, ?string $slot, int $now): void
+    {
+        $lock = $this->lock();
+        try {
+            $state = $this->operationState();
+            $revision = $schedule['revision'] ?? null;
+            if (($schedule['enabled'] ?? false) !== true || ($schedule['mode'] ?? '') !== 'online'
+                || !is_string($revision) || !preg_match('/\A[a-f0-9]{64}\z/D', $revision)
+                || !is_string($state['scheduleRevision'] ?? null) || !preg_match('/\A[a-f0-9]{64}\z/D', $state['scheduleRevision'])
+                || ($state['consistencyMode'] ?? '') !== 'online'
+                || !in_array($state['status'] ?? '', ['queued', 'capturing', 'uploading'], true)
+                || isset($state['maintenanceOwner']) || !empty($state['manualResume'])
+                || !is_int($state['autoResumeAttempts'] ?? null)
+                || !preg_match('/\A[a-f0-9]{64}\z/D', (string) ($state['id'] ?? ''))
+                || !preg_match('/\A[a-f0-9]{64}\z/D', (string) ($state['snapshotId'] ?? ''))) { return; }
+            if (@lstat(rtrim(ABSPATH, '/') . '/.maintenance') !== false) { return; }
+            // A future server deadline also applies when the scheduled configuration has changed.
+            if (is_int($state['autoResumeAt'] ?? null) && $state['autoResumeAt'] > $now) { return; }
+            $run = $this->history->find($state['id']);
+            if ($run !== null && (($run['source'] ?? '') !== 'scheduled' || ($run['snapshotId'] ?? null) !== $state['snapshotId']
+                || ($run['schedule']['revision'] ?? null) !== $state['scheduleRevision'])) { return; }
+            // A long-lived interruption can outlast the bounded journal. New jobs also carry their original slot.
+            $previousSlot = $run['scheduledAt'] ?? $state['scheduledSlot'] ?? null;
+            if (!is_string($previousSlot) || !preg_match('/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/D', $previousSlot)) { return; }
+            $events = array_column($run['events'] ?? [], 'code');
+            // Old releases did not persist manual takeover in the operation option.
+            if (in_array('resume_queued', $events, true)) { return; }
+            $recent = strtotime($run['updatedAt'] ?? $state['startedAt'] ?? '');
+            if ($recent === false || $now - $recent < 120) { return; }
+            try { $this->assertReady(); } catch (\RuntimeException $unready) { return; }
+            $sameSettings = $revision === $state['scheduleRevision'];
+            try { $this->assertBoundSettingsUnchanged($state); }
+            catch (\RuntimeException $changed) { $sameSettings = false; }
+            if ($sameSettings && self::scheduledRetryDue($state, $schedule, $now)) { return; }
+            $attempts = $state['autoResumeAttempts'];
+            $directory = $this->workspace . '/job-' . $state['id'];
+            $upload = $state['status'] === 'uploading' || ($state['status'] === 'queued' && ($state['resumeStatus'] ?? '') === 'uploading');
+            $lost = !isset($state['transferStopped']) && in_array(end($events),
+                ['upload_started', 'resumed', 'final_verification', 'auto_resume_queued', 'worker_lost_waiting'], true);
+            $last = $run === null ? null : end($run['events']);
+            // A pre-marker HTTP 500 has no method. Only an immutable payload checkpoint permits a single migration.
+            $legacy = !isset($state['scheduledSlot']) && !isset($state['transferStopped']) && $attempts === 0
+                && ($last['code'] ?? null) === 'transfer_failed' && ($last['httpStatus'] ?? null) === 500;
+            if ($sameSettings && $upload && ($lost || $legacy) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])
+                && $this->validOrphanCheckpoint($directory, $state, $legacy)) {
+                $state['status'] = 'uploading';
+                unset($state['resumeStatus']);
+                $state['autoResumeAt'] = max($now, $recent + ($legacy ? 900 : self::SCHEDULED_RETRY_DELAYS[$attempts]));
+                $this->setState($state);
+                $this->history->record($state, $legacy ? 'legacy_http_retry' : 'worker_lost_waiting', null, $legacy ? 500 : null);
+                return;
+            }
+            if ($slot === null || strcmp($previousSlot, $slot) >= 0) { return; }
+            // Keep every byte at its original absolute path. Job receipts and the capture guard bind these paths.
+            if (@lstat($directory) !== false) {
+                FileSafety::privateDirectory($directory);
+                $this->saveJob($directory, $state, 'interrupted-operation.json');
+            }
+            $state['status'] = 'failed';
+            $state['message'] = '前回の定期バックアップを未完了として保管しました。実行履歴を確認してください。';
+            unset($state['autoResumeAt']);
+            // If persisting the operation fails after journaling, the next slot repeats the same handoff.
+            $this->history->record($state, 'scheduled_released');
+            $saved = $this->history->find($state['id']);
+            if (($saved['status'] ?? '') !== 'interrupted' || end($saved['events'])['code'] !== 'scheduled_released') { return; }
+            $this->setState($state);
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
+    }
+
+    /** At most one expired detached workspace per idle tick. Remote objects and pre-policy jobs are never removed here. */
+    public function pruneExpiredScheduledWork(int $now): void
+    {
+        $lock = $this->lock();
+        try {
+            $activeId = $this->operationState()['id'] ?? null;
+            foreach (glob($this->workspace . '/job-*/interrupted-operation.json', GLOB_NOSORT) ?: [] as $marker) {
+                $directory = dirname($marker);
+                if (!preg_match('/\Ajob-([a-f0-9]{64})\z/D', basename($directory), $match) || $match[1] === $activeId) { continue; }
+                FileSafety::privateDirectory($directory);
+                FileSafety::assertRegularFile($marker);
+                $stat = lstat($marker);
+                if (($stat['mode'] & 0777) !== 0600 || $stat['nlink'] !== 1 || $stat['size'] > 65536
+                    || (function_exists('posix_geteuid') && $stat['uid'] !== posix_geteuid())) { continue; }
+                $state = json_decode((string) file_get_contents($marker), true, 32);
+                $days = $state['localRetentionDays'] ?? null;
+                if (($state['id'] ?? null) !== $match[1] || ($state['consistencyMode'] ?? '') !== 'online'
+                    || !is_string($state['scheduledSlot'] ?? null) || !empty($state['manualResume'])
+                    || !is_int($days) || $days < 1 || $days > 3650 || $stat['mtime'] + $days * 86400 > $now) { continue; }
+                $this->removePrivateDirectory($directory, $marker);
+                return;
+            }
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
+    }
+
+    private function validOrphanCheckpoint(string $directory, array $state, bool $legacy): bool
+    {
+        try {
+            FileSafety::privateDirectory($directory);
+            $job = $this->readJob($directory);
+            if (($job['version'] ?? null) !== 4 || ($job['settingsDigest'] ?? null) !== $this->settingsDigest()
+                || ($job['sharingDigest'] ?? null) !== $this->sharingDigest()) { return false; }
+            $this->assertCaptureGuard($directory, $state, $job['state'] ?? []);
+            $this->validateV4Job($job, $directory);
+            $position = $job['position'];
+            if (($job['state']['completed'] ?? null) !== $position || ($job['state']['total'] ?? null) !== count($job['objects']) + 1
+                || !in_array($job['state']['status'] ?? '', ['uploading','complete'], true)
+                || !is_int($state['completed'] ?? null) || $state['completed'] > $position) { return false; }
+            if (!$legacy) { return true; }
+            $entry = $job['objects'][$position] ?? null;
+            if (!is_string($entry['cipherFile'] ?? null) || $position !== $state['completed']) { return false; }
+            $cipher = $this->cipher($directory, $entry['cipherFile']);
+            return filesize($cipher) === $entry['object']['bytes'] && hash_file('sha256', $cipher) === $entry['object']['sha256'];
+        } catch (\RuntimeException | \InvalidArgumentException | \JsonException $error) { return false; }
     }
 
     public function queue(string $launchId, bool $resume = false, string $mode = 'maintenance', ?array $schedule = null): ?array
@@ -135,7 +251,8 @@ final class LiveBackup
                     ++$state['autoResumeAttempts'];
                 }
                 if (!is_array($state) || $state['status'] !== 'uploading') { throw new \RuntimeException('転送を再開する操作がありません。'); }
-                unset($state['autoResumeAt']);
+                unset($state['autoResumeAt'], $state['transferStopped']);
+                if (!$automatic && isset($state['scheduleRevision'])) { $state['manualResume'] = true; }
                 $state['resumeStatus'] = 'uploading';
             } else {
                 if (is_array($state) && !in_array($state['status'], ['complete', 'failed', 'cancelled'], true)) { throw new \RuntimeException('未完了のバックアップがあります。転送を再開してください。'); }
@@ -143,6 +260,10 @@ final class LiveBackup
                 $state = ['id' => bin2hex(random_bytes(32)), 'snapshotId' => bin2hex(random_bytes(32)), 'completed' => 0, 'total' => 0, 'startedAt' => gmdate('Y-m-d\TH:i:s\Z')];
                 if ($mode === 'online' && isset($schedule['revision'])) {
                     $state['scheduleRevision'] = $schedule['revision'];
+                    if (isset($schedule['slot'])) {
+                        $state['scheduledSlot'] = $schedule['slot'];
+                        $state['localRetentionDays'] = $this->settings['retentionDays'];
+                    }
                     $state['autoResumeAttempts'] = 0;
                 }
                 $state['consistencyMode'] = $mode; $state['settingsDigest'] = $this->fullSettingsDigest($this->settings); $state['sharingDigest'] = $this->sharingDigest();
@@ -267,6 +388,8 @@ final class LiveBackup
                 'message' => 'ファイルとデータベースを取得しています。'];
             if (isset($binding['scheduleRevision'])) {
                 $state['scheduleRevision'] = $binding['scheduleRevision'];
+                if (isset($binding['scheduledSlot'])) { $state['scheduledSlot'] = $binding['scheduledSlot']; }
+                if (isset($binding['localRetentionDays'])) { $state['localRetentionDays'] = $binding['localRetentionDays']; }
                 $state['autoResumeAttempts'] = $binding['autoResumeAttempts'];
             }
             if ($mode === 'maintenance') { $state['maintenanceOwner'] = $owner; }
@@ -416,17 +539,18 @@ final class LiveBackup
         // A completed job or a newer checkpoint must never be rolled back by the failure handler.
         $current = isset($state['scheduleRevision']) ? $this->operationState() : null;
         if (($current['status'] ?? null) === 'uploading' && $current['id'] === $state['id']) {
-            $before = $current['autoResumeAt'] ?? null;
+            $before = $current;
+            $current['transferStopped'] = true;
             unset($current['autoResumeAt']);
             $notBefore = $error instanceof R2HttpException ? $error->retryNotBefore() : null;
-            if (($error instanceof R2TransportException && $error->isTransient()) || $notBefore !== null) {
+            if (empty($current['manualResume']) && (($error instanceof R2TransportException && $error->isTransient()) || $notBefore !== null)) {
                 $attempts = $current['autoResumeAttempts'] ?? null;
                 if (is_int($attempts) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])) {
                     $current['autoResumeAt'] = max($notBefore ?? 0, time() + self::SCHEDULED_RETRY_DELAYS[$attempts]);
                     $code = 'auto_resume_waiting';
                 } elseif ($attempts === count(self::SCHEDULED_RETRY_DELAYS)) { $code = 'auto_resume_exhausted'; }
             }
-            if (($current['autoResumeAt'] ?? null) !== $before) { $this->setState($current); }
+            if ($current !== $before) { $this->setState($current); }
         }
         $this->history->record($state, $code, null, $error instanceof R2HttpException ? $error->getCode() : null);
     }
@@ -486,6 +610,7 @@ final class LiveBackup
         // Progress checkpoints replace the operation option. Carry its retry budget across successful steps.
         if (isset($state['scheduleRevision'])) {
             $job['state']['autoResumeAttempts'] = $state['autoResumeAttempts'];
+            if (!empty($state['manualResume'])) { $job['state']['manualResume'] = true; }
         }
         if (($job['state']['status'] ?? '') === 'complete' && $job['position'] === count($job['objects']) + 1) {
             $this->history->record($state, 'final_verification');
@@ -602,15 +727,17 @@ final class LiveBackup
         return $job['state'];
     }
 
-    private function removePrivateDirectory(string $directory): void
+    private function removePrivateDirectory(string $directory, ?string $keepUntilEnd = null): void
     {
         FileSafety::privateDirectory($directory);
         $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST);
         foreach ($iterator as $file) {
+            if ($file->getPathname() === $keepUntilEnd) { continue; }
             if ($file->isLink()) { throw new \RuntimeException('私有ディレクトリにリンクがあります。'); }
             if ($file->isDir()) { if (!rmdir($file->getPathname())) { throw new \RuntimeException('私有ディレクトリを削除できません。'); } }
             elseif (!$file->isFile() || !unlink($file->getPathname())) { throw new \RuntimeException('私有ファイルを削除できません。'); }
         }
+        if ($keepUntilEnd !== null && !unlink($keepUntilEnd)) { throw new \RuntimeException('保管期限の記録を削除できません。'); }
         if (!rmdir($directory)) { throw new \RuntimeException('私有ディレクトリを削除できません。'); }
     }
 
@@ -913,9 +1040,9 @@ final class LiveBackup
         return $lock;
     }
 
-    private function saveJob(string $directory, array $job): void
+    private function saveJob(string $directory, array $job, string $name = 'job.json'): void
     {
-        $path = $directory . '/job.json'; $temp = $directory . '/.state-' . bin2hex(random_bytes(8));
+        $path = $directory . '/' . $name; $temp = $directory . '/.state-' . bin2hex(random_bytes(8));
         $body = json_encode($job, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         if (strlen($body) > 33554432) { throw new \RuntimeException('バックアップ状態が上限を超えています。'); }
         $stream = fopen($temp, 'xb');
