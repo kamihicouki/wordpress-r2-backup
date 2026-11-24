@@ -9,6 +9,7 @@ use Throwable;
 final class WordPressAdmin
 {
     public const PAGE = 'wrb-synthetic-backup';
+
     private const FIELDS = [
         'register_keys' => ['recipient_1' => 128, 'recipient_2' => 128],
         'issue_challenge' => [],
@@ -39,6 +40,11 @@ final class WordPressAdmin
         'listing_failed' => '保存先の世代一覧を取得できませんでした。',
         'runtime_invalid' => '合成設定を検証できないため実行を停止しました。設定担当者へ確認してください。',
     ];
+
+    public static function version(): string
+    {
+        return get_file_data(dirname(__DIR__) . '/wordpress-r2-backup.php', ['version' => 'Version'])['version'];
+    }
 
     public static function register(string $pluginFile): void
     {
@@ -167,7 +173,7 @@ final class WordPressAdmin
     {
         if (!defined('WRB_SYNTHETIC_RUNTIME_PROFILE')) { LiveAdmin::render(); return; }
         $this->authorize();
-        echo '<div class="wrap wrb-synthetic"><h1>合成バックアップ <small>0.6.0 試験版</small></h1>';
+        echo '<div class="wrap wrb-synthetic"><h1>合成バックアップ <small>' . esc_html(self::version()) . ' 試験版</small></h1>';
         echo '<div class="notice notice-warning inline"><p>' . esc_html('合成データ専用です。実サイトのファイル・データベース、実Cloudflareは取得しません。小規模な合成取得を、この画面からの要求中に処理します。') . '</p></div>';
         $result = $_GET['wrb_result'] ?? null;
         if (is_string($result) && isset(self::MESSAGES[$result])) {

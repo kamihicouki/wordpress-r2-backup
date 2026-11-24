@@ -17,7 +17,7 @@ final class LiveAdminView
     public static function render(?array $settings, ?array $state, bool $busy): void
     {
         $view = LiveAdmin::view();
-        echo '<div class="wrap wrb-synthetic wrb-live"><header class="wrb-header"><p class="wrb-brand">R2 Backup <small>0.6.0</small></p><h1>' . esc_html(self::VIEWS[$view][0]) . '</h1>';
+        echo '<div class="wrap wrb-synthetic wrb-live"><header class="wrb-header"><p class="wrb-brand">R2 Backup <small>' . esc_html(WordPressAdmin::version()) . '</small></p><h1>' . esc_html(self::VIEWS[$view][0]) . '</h1>';
         echo '<nav class="wrb-nav" aria-label="R2 Backup">';
         foreach (self::VIEWS as $name => $item) {
             echo '<a href="' . esc_url(LiveAdmin::url($name)) . '"' . ($view === $name ? ' aria-current="page"' : '') . '><span class="dashicons dashicons-' . esc_attr($item[1]) . '" aria-hidden="true"></span> ' . esc_html($name === 'history' ? '実行履歴' : $item[0]) . '</a>';
