@@ -122,7 +122,7 @@ final class LiveBackup
                 || !is_string($state['scheduleRevision'] ?? null) || !preg_match('/\A[a-f0-9]{64}\z/D', $state['scheduleRevision'])
                 || ($state['consistencyMode'] ?? '') !== 'online'
                 || !in_array($state['status'] ?? '', ['queued', 'capturing', 'uploading'], true)
-                || isset($state['maintenanceOwner']) || !empty($state['manualResume'])
+                || isset($state['maintenanceOwner'])
                 || !is_int($state['autoResumeAttempts'] ?? null)
                 || !preg_match('/\A[a-f0-9]{64}\z/D', (string) ($state['id'] ?? ''))
                 || !preg_match('/\A[a-f0-9]{64}\z/D', (string) ($state['snapshotId'] ?? ''))) { return; }
@@ -137,14 +137,14 @@ final class LiveBackup
             if (!is_string($previousSlot) || !preg_match('/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/D', $previousSlot)) { return; }
             $events = array_column($run['events'] ?? [], 'code');
             // Old releases did not persist manual takeover in the operation option.
-            if (in_array('resume_queued', $events, true)) { return; }
+            $manual = !empty($state['manualResume']) || in_array('resume_queued', $events, true);
             $recent = strtotime($run['updatedAt'] ?? $state['startedAt'] ?? '');
             if ($recent === false || $now - $recent < 120) { return; }
             try { $this->assertReady(); } catch (\RuntimeException $unready) { return; }
             $sameSettings = $revision === $state['scheduleRevision'];
             try { $this->assertBoundSettingsUnchanged($state); }
             catch (\RuntimeException $changed) { $sameSettings = false; }
-            if ($sameSettings && self::scheduledRetryDue($state, $schedule, $now)) { return; }
+            if (!$manual && $sameSettings && self::scheduledRetryDue($state, $schedule, $now)) { return; }
             $attempts = $state['autoResumeAttempts'];
             $directory = $this->workspace . '/job-' . $state['id'];
             $upload = $state['status'] === 'uploading' || ($state['status'] === 'queued' && ($state['resumeStatus'] ?? '') === 'uploading');
@@ -154,7 +154,7 @@ final class LiveBackup
             // A pre-marker HTTP 500 has no method. Only an immutable payload checkpoint permits a single migration.
             $legacy = !isset($state['scheduledSlot']) && !isset($state['transferStopped']) && $attempts === 0
                 && ($last['code'] ?? null) === 'transfer_failed' && ($last['httpStatus'] ?? null) === 500;
-            if ($sameSettings && $upload && ($lost || $legacy) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])
+            if (!$manual && $sameSettings && $upload && ($lost || $legacy) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])
                 && $this->validOrphanCheckpoint($directory, $state, $legacy)) {
                 $state['status'] = 'uploading';
                 unset($state['resumeStatus']);
@@ -197,7 +197,7 @@ final class LiveBackup
                 $state = json_decode((string) file_get_contents($marker), true, 32);
                 $days = $state['localRetentionDays'] ?? null;
                 if (($state['id'] ?? null) !== $match[1] || ($state['consistencyMode'] ?? '') !== 'online'
-                    || !is_string($state['scheduledSlot'] ?? null) || !empty($state['manualResume'])
+                    || !is_string($state['scheduledSlot'] ?? null)
                     || !is_int($days) || $days < 1 || $days > 3650 || $stat['mtime'] + $days * 86400 > $now) { continue; }
                 $this->removePrivateDirectory($directory, $marker);
                 return;

@@ -354,11 +354,19 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         if ($fault === 'damaged') { unlink($job.'/capture-ready'); }
         if ($fault === 'manual') {
             $this->evalWp('(new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()))->resume(); echo "{}";');
-            // Even if the manual worker never starts, the scheduler may not take it over.
             $run['events'][]=['at'=>$previous,'code'=>'resume_queued'];
         }
         file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
         $before=$read();
+        if ($fault === 'manual') {
+            // A newly queued manual resume is protected even before its worker takes the lock.
+            $run['updatedAt']=gmdate('Y-m-d\TH:i:s\Z');
+            file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $tick(); self::assertSame($before,$read()); self::assertFileDoesNotExist($job.'/interrupted-operation.json');
+            $run['updatedAt']=$previous;
+            file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
+        }
         $checkpoint=hash_file('sha256',$job.'/job.json');
         $mustResume=in_array($fault,['legacy','terminated'],true);
         if (!$mustResume) {
@@ -370,11 +378,6 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $tick();
         $queued=$read();
         self::assertSame('queued',$queued['status']);
-        if ($fault === 'manual') {
-            self::assertSame($before,$queued);
-            self::assertFileDoesNotExist($job.'/interrupted-operation.json');
-            return;
-        }
         if ($mustResume) {
             self::assertSame($id,$queued['id']); self::assertSame($first['snapshotId'],$queued['snapshotId']);
             self::assertSame($first['completed'],$queued['completed']); self::assertSame(1,$queued['autoResumeAttempts']);
@@ -396,6 +399,11 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             $tick();
             if ($fault === 'legacy403') { self::assertFileExists($job.'/job.json'); }
             else { self::assertDirectoryDoesNotExist($job); }
+        }
+        if ($fault === 'manual') {
+            $manual=$this->evalWp('echo json_encode((new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()))->startOnline());');
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $tick(); self::assertSame($manual,$read());
         }
         if ($mustResume) {
             $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
