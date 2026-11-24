@@ -292,4 +292,128 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         }
     }
 
+    /** @dataProvider interruptedSlots */
+    public function testSchedulerRecoversADeadWorkerOrReleasesTheNextSlot(string $fault): void
+    {
+        [$plugin, $config] = $this->prepare();
+        $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo "{}";');
+        $tick = function () use ($plugin): void {
+            $r = $this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
+            self::assertSame(0, $r['exit'], $r['err']);
+        };
+        $read = fn (): array => $this->evalWp('echo json_encode(get_option("wrb_live_operation"));');
+        $workspace = $this->evalWp('echo json_encode(["path"=>WordPressR2Backup\LiveSettings::workspace()]);')['path'];
+        $store = $this->scratch.'/store';
+        self::assertTrue(mkdir($store,0700));
+        $worker = function (string $action, string $failure) use ($store): array {
+            $fixture = '$directory='.var_export($store,true).'; $action='.var_export($action,true).'; $fault='.var_export($failure,true).';'
+                .'require '.var_export(__DIR__.'/fixtures/scheduled-cipher-put.php',true).';';
+            if ($failure !== 'terminated') { return $this->evalWp($fixture); }
+            $script = $this->scratch.'/terminate.php';
+            file_put_contents($script,'<?php require '.var_export($this->wp->root().'/wp-load.php',true).';'.$fixture);
+            $r=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$script]);
+            self::assertSame(77,$r['exit'],$r['err']);
+            return [];
+        };
+        $tick();
+        $first=$worker('capture','healthy')['state'];
+        $id=$first['id'];
+        $job=$workspace.'/job-'.$id;
+        self::assertGreaterThan(0,$first['completed']);
+        if ($fault === 'exhausted') {
+            $this->evalWp('$s=get_option("wrb_live_operation"); $s["autoResumeAttempts"]=3; update_option("wrb_live_operation",$s,false); echo "{}";');
+        }
+        $failure = ['revision'=>'terminated', 'settings'=>'terminated', 'manual'=>'terminated', 'legacy403'=>'forbidden',
+            'missingHistory'=>'forbidden', 'damaged'=>'terminated', 'legacy'=>'persistent', 'exhausted'=>'persistent'][$fault] ?? $fault;
+        $worker('step', $failure);
+        if ($fault === 'revision') {
+            $this->evalWp('$c=get_option("wrb_live_schedule"); $c["revision"]=str_repeat("d",64); update_option("wrb_live_schedule",$c,false); echo "{}";');
+        } elseif ($fault === 'settings') {
+            $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["retentionDays"]=31; WordPressR2Backup\LiveSettings::save($s); echo "{}";');
+        }
+        // Advance the previous slot and event times in the isolated fixture; the real CLI clock is untouched.
+        $journal=$workspace.'/backup-history.json';
+        $data=json_decode(file_get_contents($journal),true,16,JSON_THROW_ON_ERROR);
+        $run=&$data['runs'][0];
+        $previous=gmdate('Y-m-d\TH:i:s\Z',time()-3600);
+        $run['updatedAt']=$run['scheduledAt']=$run['schedule']['slot']=$previous;
+        $last=count($run['events'])-1;
+        $run['events'][$last]['at']=$previous;
+        if ($fault === 'legacy' || $fault === 'legacy403') {
+            $run['events'][$last]=['at'=>$previous,'code'=>'transfer_failed','httpStatus'=>$fault==='legacy'?500:403];
+            $this->evalWp('$s=get_option("wrb_live_operation"); unset($s["autoResumeAt"],$s["scheduledSlot"],$s["transferStopped"],$s["localRetentionDays"]);'
+                .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        }
+        if ($fault === 'missingHistory') {
+            $data['runs']=[];
+            $this->evalWp('$s=get_option("wrb_live_operation"); $s["scheduledSlot"]=$s["startedAt"]='.var_export($previous,true).';'
+                .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        }
+        if ($fault === 'damaged') { unlink($job.'/capture-ready'); }
+        if ($fault === 'manual') {
+            $this->evalWp('(new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()))->resume(); echo "{}";');
+            $run['events'][]=['at'=>$previous,'code'=>'resume_queued'];
+        }
+        file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
+        $before=$read();
+        if ($fault === 'manual') {
+            // A newly queued manual resume is protected even before its worker takes the lock.
+            $run['updatedAt']=gmdate('Y-m-d\TH:i:s\Z');
+            file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $tick(); self::assertSame($before,$read()); self::assertFileDoesNotExist($job.'/interrupted-operation.json');
+            $run['updatedAt']=$previous;
+            file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
+        }
+        $checkpoint=hash_file('sha256',$job.'/job.json');
+        $mustResume=in_array($fault,['legacy','terminated'],true);
+        if (!$mustResume) {
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
+        }
+        $held=fopen($workspace.'/runner.lock','c+b'); self::assertTrue(flock($held,LOCK_EX|LOCK_NB));
+        try { $tick(); self::assertSame($before,$read()); } finally { fclose($held); }
+        if (!$mustResume) { $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";'); }
+        $tick();
+        $queued=$read();
+        self::assertSame('queued',$queued['status']);
+        if ($mustResume) {
+            self::assertSame($id,$queued['id']); self::assertSame($first['snapshotId'],$queued['snapshotId']);
+            self::assertSame($first['completed'],$queued['completed']); self::assertSame(1,$queued['autoResumeAttempts']);
+        } else {
+            self::assertNotSame($id,$queued['id']); self::assertNotSame($first['snapshotId'],$queued['snapshotId']);
+            self::assertSame($checkpoint,hash_file('sha256',$job.'/job.json'));
+            self::assertSame($before,json_decode(file_get_contents($job.'/interrupted-operation.json'),true));
+            $old=$this->evalWp('echo json_encode((new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->find('.var_export($id,true).'));');
+            self::assertSame('interrupted',$old['status']);
+            self::assertSame('scheduled_released',end($old['events'])['code']);
+        }
+        $done=$worker('resume','healthy');
+        self::assertNull($done['error']); self::assertSame('complete',$done['state']['status']);
+        self::assertContains('final_verification',array_column($done['events'],'code'));
+        if (!$mustResume) {
+            $marker=$job.'/interrupted-operation.json';
+            $tick(); self::assertFileExists($marker);
+            self::assertTrue(touch($marker,time()-32*86400));
+            $tick();
+            if ($fault === 'legacy403') { self::assertFileExists($job.'/job.json'); }
+            else { self::assertDirectoryDoesNotExist($job); }
+        }
+        if ($fault === 'manual') {
+            $manual=$this->evalWp('echo json_encode((new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()))->startOnline());');
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $tick(); self::assertSame($manual,$read());
+        }
+        if ($mustResume) {
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $tick(); $next=$read(); self::assertSame('queued',$next['status']); self::assertNotSame($id,$next['id']);
+        }
+    }
+
+    public function interruptedSlots(): array
+    {
+        return [['terminated'], ['forbidden'], ['exhausted'], ['legacy'], ['settings'], ['revision'], ['legacy403'], ['missingHistory'], ['damaged'], ['manual']];
+    }
+
 }
