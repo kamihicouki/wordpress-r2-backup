@@ -348,8 +348,8 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
         }
         if ($fault === 'legacyMissingHistory') { $data['runs'] = []; }
-        if ($fault === 'missingHistory') {
-            $data['runs']=[];
+        if (in_array($fault, ['missingHistory', 'corruptHistory'], true)) {
+            if ($fault === 'missingHistory') { $data['runs'] = []; }
             $this->evalWp('$s=get_option("wrb_live_operation"); $s["scheduledSlot"]=$s["startedAt"]='.var_export($previous,true).';'
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
         }
