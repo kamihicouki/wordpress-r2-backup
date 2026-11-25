@@ -580,10 +580,12 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             .'$n=file_get_contents('.var_export($space,true).'); static $calls=0; ++$calls; if ($n==="boundary") return in_array("encryptStream",array_column(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS),"function"),true) ? 1073741824+65536 : 2147483648.0; if ($n==="during") return $calls===1 ? 2147483648.0 : 4096.0; if ($n==="nan") return NAN; if ($n==="infinite") return INF; return $n==="unknown" ? false : (float)$n; }');
         $previous=['status'=>'complete','id'=>str_repeat('d',64),'snapshotId'=>str_repeat('e',64),'localCipherBytes'=>64*1024*1024];
         $this->evalWp('update_option("wrb_live_operation",'.var_export($previous,true).',false); echo "{}";');
-        $tick = function () use ($plugin,$config): array {
+        $tick = function (bool $disabled = false) use ($plugin,$config): array {
             $config['revision']=bin2hex(random_bytes(32)); $config['time']=gmdate('H:i');
             $this->evalWp('delete_option("wrb_live_schedule_runner"); update_option("wrb_live_schedule",'.var_export($config,true).',false); echo "{}";');
-            $r=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
+            $command=[PHP_BINARY,'-d','sys_temp_dir='.$this->scratch];
+            if ($disabled) { $command[]='-d'; $command[]='disable_functions=disk_free_space'; }
+            $r=$this->process(array_merge($command,[$plugin.'/schedule.php',$this->wp->root()]));
             self::assertSame(0,$r['exit'],$r['err']);
             return $this->evalWp('echo json_encode(["runner"=>get_option("wrb_live_schedule_runner"),"active"=>get_option("wrb_live_operation"),'
                 .'"history"=>(new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->latest()]);');
@@ -593,7 +595,10 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             self::assertSame('skipped',$result['runner']['lastResult']); self::assertSame($previous,$result['active']);
             self::assertSame('schedule_low_space',end($result['history']['events'])['code']);
         }
-        file_put_contents($space,(string)(2*1073741824)); $result=$tick();
+        file_put_contents($space,(string)(2*1073741824));
+        $disabled=$tick(true); self::assertSame('skipped',$disabled['runner']['lastResult']);
+        self::assertSame($previous,$disabled['active']); self::assertSame('schedule_low_space',end($disabled['history']['events'])['code']);
+        $result=$tick();
         self::assertSame('started',$result['runner']['lastResult']); self::assertSame('queued',$result['active']['status']);
         foreach (['during','boundary'] as $phase) {
             if ($phase==='boundary') { $result=$tick(); self::assertSame('started',$result['runner']['lastResult']); }
@@ -619,8 +624,9 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $fault=$this->scratch.'/fail-capture'; touch($fault);
         $evidence=$this->scratch.'/published-cipher';
         $obstruct=$this->scratch.'/block-cleanup';
+        $kill=$this->scratch.'/crash-before-checkpoint';
         file_put_contents($mu.'/fail-capture.php','<?php namespace WordPressR2Backup; function link($source,$destination) { static $n=0;'
-            .'if (is_file('.var_export($fault,true).') && str_ends_with($destination,".age") && ++$n===2) return false;'
+            .'if (is_file('.var_export($fault,true).') && str_ends_with($destination,".age") && ++$n===2) {if(is_file('.var_export($kill,true).')) exit(77); return false;}'
             .'$ok=\\link($source,$destination); if ($ok && str_ends_with($destination,".age")) file_put_contents('.var_export($evidence,true).',filesize($destination)); return $ok; }'
             .'function unlink($path) { if (is_file('.var_export($obstruct,true).') && str_ends_with($path,".age")) return false; return \\unlink($path); }'
             .'function rename($source,$dest) { if (is_file('.var_export($obstruct,true).') && basename($dest)==="interrupted-operation.json") return false; return \\rename($source,$dest); }');
@@ -674,6 +680,33 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             }
             self::assertDirectoryDoesNotExist($directory);
         }
+
+        touch($fault); touch($kill);
+        $queued=$slot(); $id=$queued['active']['id']; $abandoned=$scope.'/job-'.$id;
+        $script=$this->scratch.'/crash-capture.php';
+        file_put_contents($script,'<?php require '.var_export($this->wp->root().'/wp-load.php',true).';'
+            .'$b=new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load()); $b->begin($b->state()["launchId"]);');
+        $dead=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$script]); self::assertSame(77,$dead['exit']);
+        self::assertFileExists($abandoned.'/capture-owner.json'); self::assertFileDoesNotExist($abandoned.'/capture-ready');
+        $journalPath=$scope.'/backup-history.json';
+        $data=json_decode(file_get_contents($journalPath),true);
+        $time=gmdate('Y-m-d\TH:i:s\Z',time()-3600);
+        foreach ($data['runs'] as &$run) {
+            if ($run['id']===$id) { $run['updatedAt']=$run['scheduledAt']=$run['schedule']['slot']=$time; }
+        }
+        unset($run); file_put_contents($journalPath,json_encode($data));
+        $this->evalWp('$s=get_option("wrb_live_operation"); $s["startedAt"]='.var_export($time,true).'; $s["queuedAt"]=time()-3600;'
+            .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        unlink($kill); unlink($fault);
+        $healthy(); self::assertDirectoryDoesNotExist($abandoned);
+
+        // A manual online capture has no scheduled owner marker. Even its unsealed partial output remains untouched.
+        touch($fault);
+        $manual=$this->evalWp('$b=new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load());'
+            .'$r=new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()); $s=$r->startOnline();'
+            .'try {$b->begin($s["launchId"]);} catch (RuntimeException $e) {} echo json_encode($b->state());');
+        self::assertSame('failed',$manual['status']); $manualPath=$scope.'/job-'.$manual['id'];
+        $tick(); self::assertDirectoryExists($manualPath); self::assertFileDoesNotExist($manualPath.'/capture-owner.json');
     }
 
 }

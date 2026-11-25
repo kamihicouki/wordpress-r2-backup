@@ -241,6 +241,7 @@ final class LiveBackup
 
     private function assertScheduledFreeSpace(int $estimate = 0): void
     {
+        if (!function_exists('disk_free_space')) { throw ScheduledStorageLimit::lowSpace(); }
         $free = @disk_free_space($this->workspace);
         if ((!is_float($free) && !is_int($free)) || !is_finite((float) $free) || $free - self::WORKSPACE_RESERVE_BYTES <= $estimate) { throw ScheduledStorageLimit::lowSpace(); }
     }
@@ -288,7 +289,7 @@ final class LiveBackup
         $owner = json_decode((string) file_get_contents($path), true, 8);
         $dirStat = lstat($directory);
         if (!is_array($owner) || ($owner['version'] ?? null) !== 1 || ($owner['dev'] ?? null) !== $dirStat['dev']
-            || ($owner['ino'] ?? null) !== $dirStat['ino'] || $directory !== $this->workspace . '/job-' . ($owner['id'] ?? '')) { return null; }
+            || ($owner['ino'] ?? null) !== $dirStat['ino'] || !is_string($owner['id'] ?? null) || $directory !== $this->workspace . '/job-' . $owner['id']) { return null; }
         foreach (['id'=>64, 'snapshotId'=>64, 'scheduleRevision'=>64, 'captureGuard'=>32] as $field => $length) {
             if (!is_string($owner[$field] ?? null) || !preg_match('/\A[a-f0-9]{' . $length . '}\z/D', $owner[$field])
                 || ($expected !== null && ($expected[$field] ?? null) !== $owner[$field])) { return null; }
@@ -608,7 +609,10 @@ final class LiveBackup
                 if (isset($captureOwner) && @lstat($directory . '/capture-owner.json') === false
                     && @lstat($directory . '/job.json') === false && @lstat($directory . '/capture-ready') === false) {
                     // The owner marker itself may have failed before any capture output existed.
-                    @rmdir($directory);
+                    $currentDir = @lstat($directory);
+                    if (is_array($currentDir) && $currentDir['dev'] === $captureOwner['dev'] && $currentDir['ino'] === $captureOwner['ino']) {
+                        @rmdir($directory);
+                    }
                 }
                 if (!empty($freshScheduled) && isset($directory) && is_dir($directory) && !$this->removeFailedCapture($directory, $state)) {
                     // Reconciliation counts the pre-created owner marker even if ENOSPC also prevents this diagnostic write.
