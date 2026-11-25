@@ -313,12 +313,12 @@ final class LiveBackup
                     || !in_array($record['status'] ?? '', ['capturing', 'failed'], true)) { return false; }
             }
             // Refuse unexpected links, devices and mounted subtrees before removing the first byte.
-            $dev = lstat($directory)['dev'];
+            $rootStat = lstat($directory);
             $entries = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
                 \RecursiveIteratorIterator::SELF_FIRST);
             foreach ($entries as $entry) {
                 $info = lstat($entry->getPathname());
-                if (!is_array($info) || $info['dev'] !== $dev || $entry->isLink()
+                if (!is_array($info) || $info['dev'] !== $rootStat['dev'] || $info['uid'] !== $rootStat['uid'] || $entry->isLink()
                     || (!$entry->isDir() && (!$entry->isFile() || $info['nlink'] !== 1))) { return false; }
             }
             $this->removePrivateDirectory($directory, $directory . '/capture-owner.json');
