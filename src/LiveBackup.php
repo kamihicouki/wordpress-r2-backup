@@ -7,6 +7,8 @@ final class LiveBackup
     /** Consecutive shared packs one transfer step of a legacy job (no capture guard) reads in full together. */
     private const LEGACY_REUSED_PACK_BATCH = 4;
     private const NEW_PAGE_BATCH = 16;
+    private const MAX_INTERRUPTED_WORKSPACES = 2;
+    private const WORKSPACE_RESERVE_BYTES = 1073741824;
     private const SCHEDULED_RETRY_DELAYS = [60, 300, 900];
     private array $settings;
     private string $workspace;
@@ -164,6 +166,7 @@ final class LiveBackup
                 return;
             }
             if ($slot === null || strcmp($previousSlot, $slot) >= 0) { return; }
+            $this->assertScheduledCapacity($state, $directory);
             // Keep every byte at its original absolute path. Job receipts and the capture guard bind these paths.
             if (@lstat($directory) !== false) {
                 FileSafety::privateDirectory($directory);
@@ -178,6 +181,31 @@ final class LiveBackup
             if (($saved['status'] ?? '') !== 'interrupted' || end($saved['events'])['code'] !== 'scheduled_released') { return; }
             $this->setState($state);
         } finally { flock($lock, LOCK_UN); fclose($lock); }
+    }
+
+    /** Called under operation.lock before giving up the active generation or admitting a new scheduled capture. */
+    private function assertScheduledCapacity(?array $previous, ?string $pendingDirectory = null): int
+    {
+        $count = 0;
+        foreach (new \FilesystemIterator($this->workspace) as $entry) {
+            if (!preg_match('/\Ajob-[a-f0-9]{64}\z/D', $entry->getFilename()) || $entry->isLink() || !$entry->isDir()) { continue; }
+            $path = $entry->getPathname();
+            // A pending handoff may already have a marker if a previous journal write was interrupted.
+            if ($path === $pendingDirectory || @lstat($path . '/interrupted-operation.json') !== false) {
+                if (++$count >= self::MAX_INTERRUPTED_WORKSPACES) { throw ScheduledStorageLimit::countLimit(); }
+            }
+        }
+        // A completed v4 capture already measured the bytes encrypted locally. Shared R2 data is excluded.
+        $estimate = $previous['localCipherBytes'] ?? $previous['measurements']['capture']['encryptPlainBytes'] ?? $previous['estimatedLocalCipherBytes'] ?? 0;
+        $estimate = is_int($estimate) && $estimate > 0 ? $estimate : 0;
+        $this->assertScheduledFreeSpace($estimate);
+        return $estimate;
+    }
+
+    private function assertScheduledFreeSpace(int $estimate = 0): void
+    {
+        $free = @disk_free_space($this->workspace);
+        if (!is_numeric($free) || $free - self::WORKSPACE_RESERVE_BYTES <= $estimate) { throw ScheduledStorageLimit::lowSpace(); }
     }
 
     /** At most one expired detached workspace per idle tick. Remote objects and pre-policy jobs are never removed here. */
@@ -257,8 +285,11 @@ final class LiveBackup
             } else {
                 if (is_array($state) && !in_array($state['status'], ['complete', 'failed', 'cancelled'], true)) { throw new \RuntimeException('未完了のバックアップがあります。転送を再開してください。'); }
                 if (@lstat(rtrim(ABSPATH, '/') . '/.maintenance') !== false) { throw new \RuntimeException('保守状態が残っています。未完了の実行を取り消してから取得してください。'); }
+                $scheduled = $mode === 'online' && isset($schedule['revision']);
+                $estimate = $scheduled ? $this->assertScheduledCapacity($state) : 0;
                 $state = ['id' => bin2hex(random_bytes(32)), 'snapshotId' => bin2hex(random_bytes(32)), 'completed' => 0, 'total' => 0, 'startedAt' => gmdate('Y-m-d\TH:i:s\Z')];
-                if ($mode === 'online' && isset($schedule['revision'])) {
+                if ($scheduled) {
+                    $state['estimatedLocalCipherBytes'] = $estimate;
                     $state['scheduleRevision'] = $schedule['revision'];
                     if (isset($schedule['slot'])) {
                         $state['scheduledSlot'] = $schedule['slot'];
@@ -381,12 +412,18 @@ final class LiveBackup
                 } finally { fclose($file); }
                 $owner = ['dev' => $maintenanceStat['dev'], 'ino' => $maintenanceStat['ino'], 'token' => $maintenanceToken, 'sha256' => hash('sha256', $marker)];
             }
+            if (isset($binding['scheduleRevision'])) {
+                // Report capacity lost after queueing against the original run before creating any job files.
+                $state = $existing;
+                $this->assertScheduledFreeSpace($binding['estimatedLocalCipherBytes'] ?? 0);
+            }
             $id = $queued ? $existing['id'] : bin2hex(random_bytes(32));
             $directory = FileSafety::createPrivateDirectory($this->workspace . '/job-' . $id);
             $state = ['id' => $id, 'snapshotId' => $queued ? $existing['snapshotId'] : bin2hex(random_bytes(32)), 'status' => 'capturing', 'completed' => 0, 'total' => 0, 'startedAt' => gmdate('Y-m-d\TH:i:s\Z'),
                 'captureGuard' => bin2hex(random_bytes(16)),
                 'message' => 'ファイルとデータベースを取得しています。'];
             if (isset($binding['scheduleRevision'])) {
+                $state['estimatedLocalCipherBytes'] = $binding['estimatedLocalCipherBytes'] ?? 0;
                 $state['scheduleRevision'] = $binding['scheduleRevision'];
                 if (isset($binding['scheduledSlot'])) { $state['scheduledSlot'] = $binding['scheduledSlot']; }
                 if (isset($binding['localRetentionDays'])) { $state['localRetentionDays'] = $binding['localRetentionDays']; }
@@ -403,7 +440,7 @@ final class LiveBackup
             $index = $this->contentIndex($directory);
             $operation = function () use ($directory, $state, $maintenance, $owner, $mode, &$marker, &$lastRefresh, &$progressSnapshot, $index): array {
                 return $this->sourceV4($directory, $owner)->capture(new AgeProcess(AgeBinary::path()), $this->settings['recipients'], $state['snapshotId'], $this->v4Scope(), function (array $progress) use ($state, $maintenance, $owner, $mode, &$marker, &$lastRefresh, &$progressSnapshot): void {
-                    if ($mode === 'online') { $this->recordOnlineProgress($progressSnapshot, $progress, $state['id'], $lastRefresh); }
+                    if ($mode === 'online') { $this->recordOnlineProgress($progressSnapshot, $progress, $state['id'], $lastRefresh, isset($state['scheduleRevision'])); }
                     else { $this->recordCaptureProgress($progressSnapshot,$progress,$state['id'],$maintenance,$owner,$marker,$lastRefresh); }
                 }, $index, $mode);
             };
@@ -417,6 +454,13 @@ final class LiveBackup
             if (is_array($capture['measurements'] ?? null)) { $job['state']['measurements'] = ['version' => 1, 'capture' => self::measurementValues($capture['measurements'])]; }
             $this->validateV4Job($job, $directory);
             $job['state']['status'] = 'uploading';
+            if (isset($state['scheduleRevision'])) {
+                $localBytes = 0;
+                foreach ($capture['objects'] as $entry) {
+                    if ($entry['cipherFile'] !== null) { $localBytes += $entry['object']['bytes']; }
+                }
+                $job['state']['localCipherBytes'] = $localBytes;
+            }
             $job['state']['total'] = count($capture['objects']) + 1;
             $job['state']['message'] = '暗号化済みデータをR2へ転送できます。';
             // WordPress stops respecting .maintenance after ten minutes. Never publish a capture if it lapsed, even if
@@ -440,6 +484,9 @@ final class LiveBackup
                 $state['status'] = 'failed'; $state['message'] = $error instanceof UnsupportedOnlineDatabaseEngine
                     ? '保守なしでは、対象データベースにInnoDB以外のテーブルがあるため実行できません。'
                     : '取得を完了できませんでした。安全な完了世代は公開していません。';
+                if ($error instanceof ScheduledStorageLimit) { $state['message'] = $error->getMessage(); }
+                // Capture can fail before a transfer checkpoint exists. Its partial files also consume one slot.
+                if (isset($state['scheduledSlot'], $directory)) { $this->saveJob($directory, $state, 'interrupted-operation.json'); }
                 $this->setState($state);
                 $this->history->record($state, BackupHistory::captureError($error));
             }
@@ -871,10 +918,11 @@ final class LiveBackup
     }
 
     /** Snapshot callbacks must never issue writes on the capture's database connection. */
-    private function recordOnlineProgress(array &$current, array $update, string $id, int &$lastRefresh): void
+    private function recordOnlineProgress(array &$current, array $update, string $id, int &$lastRefresh, bool $scheduled = false): void
     {
         $current = $this->mergeProgress($current, $update);
         if (time() - $lastRefresh < 15) { return; }
+        if ($scheduled) { $this->assertScheduledFreeSpace(); }
         $this->writeProgress($current + ['id' => $id, 'updatedAt' => gmdate('Y-m-d\TH:i:s\Z')]);
         $lastRefresh = time();
     }
