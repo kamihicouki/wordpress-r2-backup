@@ -52,6 +52,7 @@ try {
             wp_cache_delete('wrb_live_schedule_runner', 'options'); wp_cache_delete('notoptions', 'options');
             if (get_option('wrb_live_schedule_runner', null) !== $value) { throw new RuntimeException('Schedule state could not be recorded.'); }
         };
+        $storageLimit = null;
         // Only detached scheduled operations without a retry deadline need reconciliation.
         if (($config['enabled'] ?? false) === true && ($config['mode'] ?? '') === 'online') {
             wp_cache_delete('wrb_live_operation', 'options');
@@ -68,6 +69,8 @@ try {
                     if (is_array($currentSettings)) {
                         (new \WordPressR2Backup\LiveRunner($currentSettings))->reconcileScheduled($config, $slot, $now->getTimestamp());
                     }
+                } catch (\WordPressR2Backup\ScheduledStorageLimit $limit) {
+                    $storageLimit = $limit;
                 } catch (Throwable $error) {
                     // Leave the existing operation in place. The regular slot path records busy/unavailable.
                     fwrite(STDERR, "中断した定期実行を確認できませんでした。\n");
@@ -97,6 +100,7 @@ try {
                         wp_cache_delete(\WordPressR2Backup\LiveSettings::OPTION, 'options'); wp_cache_delete('notoptions', 'options');
                         $settings = \WordPressR2Backup\LiveSettings::load();
                         if (!is_array($settings)) { throw new RuntimeException('Backup settings are missing.'); }
+                        if ($storageLimit !== null) { throw $storageLimit; }
                         $queued = (new \WordPressR2Backup\LiveRunner($settings))->startOnline($config + ['slot' => $slot, 'timezone' => $zone->getName()]);
                         $digest = hash('sha256', json_encode($settings, JSON_THROW_ON_ERROR));
                         if (($queued['status'] ?? '') !== 'queued' || ($queued['consistencyMode'] ?? '') !== 'online'
@@ -106,21 +110,30 @@ try {
                         }
                         $state['status'] = 'started'; $state['lastResult'] = 'started';
                         $state['message'] = '保守なしバックアップの起動を受け付けました。実行状況を確認してください。';
+                    } catch (\WordPressR2Backup\ScheduledStorageLimit $limit) {
+                        $storageLimit = $limit;
+                        $state['status'] = $state['lastResult'] = 'skipped';
+                        $state['message'] = $limit->getMessage();
                     } catch (Throwable $error) {
                         // The worker may have started before an acknowledgement was lost; never retry this slot.
                         wp_cache_delete('wrb_live_operation', 'options'); wp_cache_delete('notoptions', 'options');
                         $active = get_option('wrb_live_operation', null);
                         $busy = is_array($active) && in_array($active['status'] ?? '', ['queued', 'capturing', 'uploading'], true);
-                        $state['status'] = $state['lastResult'] = $busy ? 'skipped' : 'failed';
-                        $state['message'] = $busy ? '未完了のバックアップがあるため、この予定の実行を見送りました。'
-                            : '起動依頼を確認できません。自動再試行せず、バックアップの状態を確認してください。';
+                        $waiting = $busy && is_int($active['autoResumeAt'] ?? null) && $active['autoResumeAt'] > $now->getTimestamp();
+                        $state['status'] = $state['lastResult'] = $waiting ? 'storage_wait' : ($busy ? 'skipped' : 'failed');
+                        $state['message'] = !$busy ? '起動依頼を確認できません。自動再試行せず、バックアップの状態を確認してください。'
+                            : ($waiting ? '保存先への再試行時刻に達していないため、定期実行を見送りました。'
+                                : '未完了のバックアップがあるため、この予定の実行を見送りました。');
                     }
                 }
             } else {
                 $state['status'] = 'unavailable'; $state['lastResult'] = 'unavailable';
                 $state['message'] = '安全な自動取得の準備が未完了のため開始しませんでした。';
             }
-            if ($state['lastResult'] !== 'started') { $record($slot, $config, $settings, $state['lastResult']); }
+            if ($state['lastResult'] !== 'started') {
+                $outcome = $state['lastResult'] === 'skipped' && $storageLimit !== null ? $storageLimit->outcome() : $state['lastResult'];
+                $record($slot, $config, $settings, $outcome);
+            }
         } else { $state['status'] = 'not_due'; }
         $persist($state);
         // Retry only a known interrupted scheduled operation, independently of the next new capture slot.

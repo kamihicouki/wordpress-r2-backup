@@ -53,7 +53,8 @@ function wrbWorkerMain(array $arguments): void
     $ticket = $arguments[1]; $data = wrbWorkerTicket($ticket, $token); $workspace = $data['workspace']; $path = $workspace . '/runner.lock';
     $before = @lstat($path);
     if ($before !== false && (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1 || $before['uid'] !== posix_geteuid())) { throw new RuntimeException('Invalid lock.'); }
-    $lock = @fopen($path, 'c+b');
+    // Subprocesses used during capture must not keep this worker's lock alive.
+    $lock = @fopen($path, 'c+be');
     if (!is_resource($lock)) { throw new RuntimeException('Invalid lock.'); }
     $authorized = false;
     try {

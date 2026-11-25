@@ -10,6 +10,10 @@ final class BackupHistory
     private const MAX_BYTES = 3145728;
     // Preserve the journal format understood by earlier releases. Retry details refine existing events.
     private const RETRY_EVENTS = [
+        'schedule_retained_limit' => 'schedule_skipped',
+        'schedule_low_space' => 'schedule_skipped',
+        'capture_low_space' => 'capture_failed',
+        'schedule_storage_wait' => 'schedule_skipped',
         'legacy_http_retry' => 'transfer_connection',
         'worker_lost_waiting' => 'transfer_connection',
         'scheduled_released' => 'transfer_failed',
@@ -44,6 +48,10 @@ final class BackupHistory
         'capture_unsupported_engine' => ['failed', '保守なしで取得できない形式のデータベーステーブルがあり、取得を中止しました。'],
         'transfer_connection' => ['interrupted', 'R2への接続が途切れました。保存済みの位置から転送を再開できます。'],
         'transfer_failed' => ['interrupted', '転送または照合を完了できませんでした。保存済みの位置から転送を再開できます。'],
+        'schedule_retained_limit' => ['skipped', '未完了の定期バックアップが保管上限の2世代に達したため、新規取得を見送りました。'],
+        'schedule_low_space' => ['skipped', '作業領域の空き容量を確保できないため、新規取得を見送りました。'],
+        'capture_low_space' => ['failed', '作業領域の空き容量を確保できないため、取得を停止しました。'],
+        'schedule_storage_wait' => ['skipped', '保存先への再試行時刻に達していないため、接続先への新しい定期実行も見送りました。'],
         'schedule_skipped' => ['skipped', '他のバックアップ処理があるため、定期実行を見送りました。'],
         'schedule_failed' => ['failed', '定期バックアップを起動できませんでした。'],
         'schedule_unavailable' => ['skipped', '実行に必要な設定または実行環境を確認できませんでした。'],
@@ -192,6 +200,7 @@ final class BackupHistory
 
     public static function captureError(\Throwable $error): string
     {
+        if ($error instanceof ScheduledStorageLimit) { return 'capture_low_space'; }
         if ($error instanceof SourcePathCollision) { return 'capture_path_collision'; }
         if ($error instanceof SourcePathReviewRequired) { return 'capture_path_review'; }
         return $error instanceof UnsupportedOnlineDatabaseEngine ? 'capture_unsupported_engine' : 'capture_failed';
