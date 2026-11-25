@@ -142,7 +142,8 @@ final class BackupHistory
             $index = self::index($runs, $id);
             $run = $index === null ? self::newRun($id, $state, 'unknown', null) : $runs[$index];
             if ($code === 'scheduled_released' && $run['source'] === 'unknown'
-                && self::isId($state['scheduleRevision'] ?? null) && ($run['snapshotId'] ?? $state['snapshotId']) === $state['snapshotId']) {
+                && self::isId($state['scheduleRevision'] ?? null) && self::isId($state['snapshotId'] ?? null)
+                && ($run['snapshotId'] ?? $state['snapshotId']) === $state['snapshotId']) {
                 $run['source'] = 'scheduled';
                 $run['schedule'] = ['revision' => $state['scheduleRevision']];
                 if (self::isTime($state['scheduledSlot'] ?? null)) {
