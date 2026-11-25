@@ -174,7 +174,8 @@ final class LiveRunner
     private static function runnerLock(string $workspace, bool $nonblocking, bool $skipBusy = false)
     {
         FileSafety::privateDirectory($workspace); $path = $workspace . '/runner.lock'; FileSafety::assertNoLinks($path);
-        $lock = @fopen($path, 'c+b');
+        // The detached worker must acquire its own lock, even if the launcher is killed.
+        $lock = @fopen($path, 'c+be');
         $wouldBlock = 0;
         if ($lock === false || !chmod($path, 0600) || !flock($lock, LOCK_EX | ($nonblocking ? LOCK_NB : 0), $wouldBlock)) {
             if (is_resource($lock)) { fclose($lock); }

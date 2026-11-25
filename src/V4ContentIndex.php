@@ -313,7 +313,8 @@ final class V4ContentIndex
             FileSafety::assertRegularFile($path);
             if ((fileperms($path) & 0777) !== 0600) { throw new RuntimeException('Unsafe index lock.'); }
         }
-        $stream = fopen($path, 'c+b');
+        // Capture and publication run subprocesses while holding this lock.
+        $stream = fopen($path, 'c+be');
         if ($stream === false) { throw new RuntimeException('Cannot open index lock.'); }
         try {
             if (!chmod($path, 0600) || !flock($stream, LOCK_EX)) { throw new RuntimeException('Cannot lock the v4 index.'); }
