@@ -16,28 +16,23 @@ final class R2DestinationRetry
     public function assertAvailable(int $now): void
     {
         $deadline = $this->read();
-        // An interrupted first write may have published the lock but not the deadline.
-        if ($deadline === null && @lstat($this->path . '.lock') !== false) {
-            $deadline = $this->read();
-            if ($deadline === null) { throw ScheduledStorageLimit::storageWait(); }
+        if ($deadline === null) {
+            $lockPath = $this->path . '.lock';
+            clearstatcache(true, $lockPath);
+            if (@lstat($lockPath) !== false) {
+                // A partial first write can leave an idle lock. Recheck after acquiring the same inode.
+                $lock = $this->openLock($lockPath, false);
+                try { $deadline = $this->read(); }
+                finally { fclose($lock); }
+            }
         }
         if ($deadline !== null && $deadline > $now) { throw ScheduledStorageLimit::storageWait($deadline); }
     }
 
     public function record(int $deadline): void
     {
-        $lockPath = $this->path . '.lock';
-        $previous = @lstat($lockPath);
-        if ($previous !== false && !self::ownerFile($previous)) { throw ScheduledStorageLimit::storageWait(); }
-        $mask = umask(0077);
-        try { $lock = @fopen($lockPath, 'c+be'); }
-        finally { umask($mask); }
-        if (!is_resource($lock)) { throw ScheduledStorageLimit::storageWait(); }
+        $lock = $this->openLock($this->path . '.lock', true);
         try {
-            clearstatcache(true, $lockPath);
-            $current = @lstat($lockPath); $open = fstat($lock);
-            if (!self::ownerFile($current) || !self::ownerFile($open) || $current['ino'] !== $open['ino']
-                || $current['dev'] !== $open['dev'] || !flock($lock, LOCK_EX)) { throw ScheduledStorageLimit::storageWait(); }
             if (($this->read() ?? 0) >= $deadline) { return; }
             $pending = $this->path . '-' . bin2hex(random_bytes(12)) . '.tmp';
             $mask = umask(0077);
@@ -52,6 +47,27 @@ final class R2DestinationRetry
                 if (!rename($pending, $this->path)) { throw ScheduledStorageLimit::storageWait(); }
             } finally { if (is_file($pending)) { @unlink($pending); } }
         } finally { fclose($lock); }
+    }
+
+    private function openLock(string $path, bool $create)
+    {
+        clearstatcache(true, $path);
+        $previous = @lstat($path);
+        if ($previous !== false && !self::ownerFile($previous)) { throw ScheduledStorageLimit::storageWait(); }
+        if ($create) {
+            $mask = umask(0077);
+            try { $lock = @fopen($path, 'c+be'); }
+            finally { umask($mask); }
+        } else { $lock = @fopen($path, 'r+be'); }
+        if (!is_resource($lock)) { throw ScheduledStorageLimit::storageWait(); }
+        try {
+            if (!flock($lock, LOCK_EX | ($create ? 0 : LOCK_NB))) { throw ScheduledStorageLimit::storageWait(); }
+            clearstatcache(true, $path);
+            $current = @lstat($path); $open = fstat($lock);
+            if (!self::ownerFile($current) || !self::ownerFile($open) || $current['ino'] !== $open['ino']
+                || $current['dev'] !== $open['dev']) { throw ScheduledStorageLimit::storageWait(); }
+            return $lock;
+        } catch (\Throwable $error) { fclose($lock); throw $error; }
     }
 
     private function read(): ?int

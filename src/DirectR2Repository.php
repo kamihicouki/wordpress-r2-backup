@@ -106,7 +106,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
     {
         if ($this->destinationRetry === null || $header === null || !in_array($status, [429, 503], true)) { return; }
         $deadline = (new R2HttpException($status, $header))->retryNotBefore();
-        if ($deadline === null || $deadline > time()) { $this->destinationRetry->record($deadline ?? PHP_INT_MAX); }
+        if ($deadline !== null && $deadline > time()) { $this->destinationRetry->record($deadline); }
     }
 
     public function putNew(string $objectKey, string $cipherFile): array
