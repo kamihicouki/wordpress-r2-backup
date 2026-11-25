@@ -112,7 +112,7 @@ try {
                         $state['message'] = '保守なしバックアップの起動を受け付けました。実行状況を確認してください。';
                     } catch (\WordPressR2Backup\ScheduledStorageLimit $limit) {
                         $storageLimit = $limit;
-                        $state['status'] = $state['lastResult'] = 'skipped';
+                        $state['status'] = $state['lastResult'] = $limit->outcome() === 'storage_wait' ? 'storage_wait' : 'skipped';
                         $state['message'] = $limit->getMessage();
                     } catch (Throwable $error) {
                         // The worker may have started before an acknowledgement was lost; never retry this slot.
@@ -144,7 +144,13 @@ try {
                 \WordPressR2Backup\BackupScheduler::assertOnlineRelease(__DIR__);
                 $settings = \WordPressR2Backup\LiveSettings::load();
                 if (!is_array($settings)) { throw new RuntimeException('Backup settings are missing.'); }
-                (new \WordPressR2Backup\LiveRunner($settings))->resumeScheduled($config, $active['id']);
+                try {
+                    (new \WordPressR2Backup\LiveRunner($settings))->resumeScheduled($config, $active['id']);
+                } catch (\WordPressR2Backup\ScheduledStorageLimit $limit) {
+                    if ($limit->outcome() !== 'storage_wait') { throw $limit; }
+                    $state['message'] = $limit->getMessage();
+                    $persist($state);
+                }
             }
         }
         fwrite(STDOUT, json_encode(['status' => $state['status']], JSON_THROW_ON_ERROR) . "\n");

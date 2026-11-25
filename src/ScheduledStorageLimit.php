@@ -23,5 +23,13 @@ final class ScheduledStorageLimit extends \RuntimeException
         return new self('low_space', 'バックアップ作業領域の空き容量を確保できないため、定期取得を停止しました。');
     }
 
+    public static function storageWait(?int $deadline = null): self
+    {
+        if ($deadline === null || $deadline > 253402300799) {
+            return new self('storage_wait', 'R2保存先の待機期限を確認できないため、通信を見送りました。');
+        }
+        return new self('storage_wait', 'R2保存先への再試行可能時刻は ' . gmdate('Y-m-d H:i:s', $deadline) . ' UTC です。期限まで通信を見送ります。');
+    }
+
     public function outcome(): string { return $this->outcome; }
 }

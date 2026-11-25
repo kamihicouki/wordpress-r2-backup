@@ -22,6 +22,7 @@ final class LiveBackup
         $this->workspace = LiveSettings::workspace();
         $this->history = new BackupHistory($this->workspace);
         $this->repository = $repository ?? new DirectR2Repository(array_intersect_key($settings, array_flip(['accountId', 'bucket', 'accessKeyId', 'secretAccessKey', 'unitId'])));
+        $this->repository->bindRetryWorkspace($this->workspace);
     }
 
     public function source(string $directory): WordPressSource
@@ -117,6 +118,7 @@ final class LiveBackup
     {
         $lock = $this->lock();
         try {
+            if ($slot !== null) { $this->repository->assertDestinationAvailable($now); }
             $state = $this->operationState();
             $revision = $schedule['revision'] ?? null;
             if (($schedule['enabled'] ?? false) !== true || ($schedule['mode'] ?? '') !== 'online'
@@ -360,7 +362,9 @@ final class LiveBackup
             if ($resume) {
                 if ($automatic) {
                     // Recheck under operation.lock after acquiring runner.lock. Cancellation and manual resume can win.
-                    if (!self::scheduledRetryDue($state, $schedule, time()) || $state['id'] !== ($schedule['operationId'] ?? null)) { return null; }
+                    $now = time();
+                    if (!self::scheduledRetryDue($state, $schedule, $now) || $state['id'] !== ($schedule['operationId'] ?? null)) { return null; }
+                    $this->repository->assertDestinationAvailable($now);
                     try {
                         $this->assertReady();
                         $this->assertBoundSettingsUnchanged($state);
@@ -380,6 +384,7 @@ final class LiveBackup
                 if (is_array($state) && !in_array($state['status'], ['complete', 'failed', 'cancelled'], true)) { throw new \RuntimeException('未完了のバックアップがあります。転送を再開してください。'); }
                 if (@lstat(rtrim(ABSPATH, '/') . '/.maintenance') !== false) { throw new \RuntimeException('保守状態が残っています。未完了の実行を取り消してから取得してください。'); }
                 $scheduled = $mode === 'online' && isset($schedule['revision']);
+                if ($scheduled) { $this->repository->assertDestinationAvailable(time()); }
                 $estimate = $scheduled ? $this->assertScheduledCapacity($state) : 0;
                 $state = ['id' => bin2hex(random_bytes(32)), 'snapshotId' => bin2hex(random_bytes(32)), 'completed' => 0, 'total' => 0, 'startedAt' => gmdate('Y-m-d\TH:i:s\Z')];
                 if ($scheduled) {
