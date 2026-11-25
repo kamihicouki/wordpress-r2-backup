@@ -127,6 +127,7 @@ final class LiveBackup
                 || !preg_match('/\A[a-f0-9]{64}\z/D', (string) ($state['id'] ?? ''))
                 || !preg_match('/\A[a-f0-9]{64}\z/D', (string) ($state['snapshotId'] ?? ''))) { return; }
             if (@lstat(rtrim(ABSPATH, '/') . '/.maintenance') !== false) { return; }
+            if (is_int($state['autoResumeAt'] ?? null) && $state['autoResumeAt'] > $now) { return; }
             try { $run = $this->history->find($state['id']); }
             catch (\RuntimeException $error) {
                 // The journal is advisory. Preserve the operation data if its files can still be written.
@@ -150,25 +151,25 @@ final class LiveBackup
                 if (is_array($ticket)) { $recent = max($recent, $ticket['mtime']); }
             }
             if ($now - $recent < 120) { return; }
-            $waiting = is_int($state['autoResumeAt'] ?? null) && $state['autoResumeAt'] > $now;
-            // Never send this operation before its server deadline. A long deadline must not reserve every future slot.
-            if ($waiting && ($slot === null || $now - $recent < max(self::SCHEDULED_RETRY_DELAYS))) { return; }
+            $directory = $this->workspace . '/job-' . $state['id'];
+            if ($run === null && !isset($state['queuedAt'])) {
+                $checkpoint = @lstat($directory . '/job.json');
+                if (is_array($checkpoint) && $now - $checkpoint['mtime'] < 120) { return; }
+            }
             try { $this->assertReady(); } catch (\RuntimeException $unready) { return; }
             $sameSettings = $revision === $state['scheduleRevision'];
             try { $this->assertBoundSettingsUnchanged($state); }
             catch (\RuntimeException $changed) { $sameSettings = false; }
             if (!$manual && $sameSettings && self::scheduledRetryDue($state, $schedule, $now)) { return; }
             $attempts = $state['autoResumeAttempts'];
-            $directory = $this->workspace . '/job-' . $state['id'];
             $upload = $state['status'] === 'uploading' || ($state['status'] === 'queued' && ($state['resumeStatus'] ?? '') === 'uploading');
-            $lost = !isset($state['transferStopped']) && (in_array(end($events),
-                ['upload_started', 'resumed', 'final_verification', 'auto_resume_queued', 'worker_lost_waiting'], true)
-                || ($run === null && isset($state['scheduledSlot'])));
+            $lost = !isset($state['transferStopped']) && in_array(end($events),
+                ['upload_started', 'resumed', 'final_verification', 'auto_resume_queued', 'worker_lost_waiting'], true);
             $last = $run === null ? null : end($run['events']);
             // A pre-marker HTTP 500 has no method. Only an immutable payload checkpoint permits a single migration.
             $legacy = !isset($state['scheduledSlot']) && !isset($state['transferStopped']) && $attempts === 0
                 && ($last['code'] ?? null) === 'transfer_failed' && ($last['httpStatus'] ?? null) === 500;
-            if (!$manual && $sameSettings && !$waiting && $upload && ($lost || $legacy) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])
+            if (!$manual && $sameSettings && $upload && ($lost || $legacy) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])
                 && $this->validOrphanCheckpoint($directory, $state, $legacy)) {
                 $state['status'] = 'uploading';
                 unset($state['resumeStatus']);
@@ -182,6 +183,10 @@ final class LiveBackup
             if (@lstat($directory) !== false) {
                 FileSafety::privateDirectory($directory);
                 $this->saveJob($directory, $state, 'interrupted-operation.json');
+                $saved = file_get_contents($directory . '/interrupted-operation.json');
+                if (!is_string($saved) || json_decode($saved, true, 64, JSON_THROW_ON_ERROR) !== $state) {
+                    throw new \RuntimeException('未完了の定期実行の保管記録を照合できません。');
+                }
             }
             $state['status'] = 'failed';
             $state['message'] = '前回の定期バックアップを未完了として保管しました。実行履歴を確認してください。';
