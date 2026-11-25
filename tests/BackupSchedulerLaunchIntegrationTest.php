@@ -223,6 +223,12 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertSame($temporary,$read(), 'Retry-After must survive a new scheduler process');
         $dueNow();
         $tick();
+        self::assertSame('uploading', $read()['status'], 'An eligible operation must still respect the destination deadline');
+        self::assertSame(0, $read()['autoResumeAttempts']);
+        $this->evalWp('$s=WordPressR2Backup\LiveSettings::load();'
+            .'$marker=WordPressR2Backup\LiveSettings::workspace()."/r2-retry-".hash("sha256",$s["accountId"]."/".$s["bucket"]);'
+            .'if(!is_file($marker)) throw new RuntimeException("Expected retry marker"); file_put_contents($marker,(time()-1)."\n"); echo "{}";');
+        $tick();
         $recovered=$this->evalWp($worker.'$fault=0;'.$resumeWorker);
         self::assertSame('complete',$recovered['status']);
         self::assertSame($second['snapshotId'],$recovered['snapshotId']);
@@ -234,6 +240,28 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertStringContainsString('HTTP 503',$waiting['message']);
         self::assertContains('final_verification',$codes);
         self::assertSame('complete',end($codes));
+    }
+
+    public function testDestinationThrottleBlocksTheNextSlotWithoutAnOperationRetryBudget(): void
+    {
+        [$plugin, $config] = $this->prepare();
+        $throttled = $this->evalWp('$settings=WordPressR2Backup\LiveSettings::load();'
+            .'$connection=array_intersect_key($settings,array_flip(["accountId","bucket","accessKeyId","secretAccessKey","unitId"]));'
+            .'$repository=new WordPressR2Backup\DirectR2Repository($connection,static fn()=>["status"=>429,"headers"=>["Retry-After"=>"3600"]]);'
+            .'$backup=new WordPressR2Backup\LiveBackup($settings,$repository);'
+            .'try {iterator_to_array($repository->listPackObjects(str_repeat("e",64)));} catch(WordPressR2Backup\R2HttpException $error) {$deadline=$error->retryNotBefore();}'
+            .'update_option("wrb_live_operation",["status"=>"failed"],false); echo json_encode(["deadline"=>$deadline??null]);');
+        self::assertNotNull($throttled['deadline']);
+        $run = $this->process([PHP_BINARY, '-d', 'sys_temp_dir='.$this->scratch, $plugin.'/schedule.php', $this->wp->root()]);
+        self::assertSame(0, $run['exit'], $run['err']);
+        $result = $this->evalWp('$workspace=WordPressR2Backup\LiveSettings::workspace();'
+            .'echo json_encode(["operation"=>get_option("wrb_live_operation"),"runner"=>get_option("wrb_live_schedule_runner"),'
+            .'"history"=>(new WordPressR2Backup\BackupHistory($workspace))->latest(),"tickets"=>glob($workspace."/launch-*.json")]);');
+        self::assertSame(['status' => 'failed'], $result['operation']);
+        self::assertSame('storage_wait', $result['runner']['lastResult']);
+        self::assertStringContainsString(gmdate('Y-m-d H:i:s', $throttled['deadline']), $result['runner']['message']);
+        self::assertSame('schedule_storage_wait', $result['history']['events'][0]['code']);
+        self::assertSame([], $result['tickets']);
     }
     public function testHttp500ConditionalPutResumesOnlyWithVerifiedCiphertextAndWithinBudget(): void
     {
