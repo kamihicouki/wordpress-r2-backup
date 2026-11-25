@@ -347,7 +347,10 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             $this->evalWp('$s=get_option("wrb_live_operation"); unset($s["autoResumeAt"],$s["scheduledSlot"],$s["transferStopped"],$s["transferStoppedAt"],$s["localRetentionDays"]);'
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
         }
-        if ($fault === 'legacyMissingHistory') { $data['runs'] = []; }
+        if (in_array($fault, ['legacyMissingHistory', 'missingHistory', 'corruptHistory'], true)) {
+            self::assertTrue(touch($job.'/job.json', time()-3600));
+            if ($fault === 'legacyMissingHistory') { $data['runs'] = []; }
+        }
         if (in_array($fault, ['missingHistory', 'corruptHistory'], true)) {
             if ($fault === 'missingHistory') { $data['runs'] = []; }
             $this->evalWp('$s=get_option("wrb_live_operation"); $s["scheduledSlot"]=$s["startedAt"]='.var_export($previous,true).';'
@@ -363,6 +366,14 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             self::assertSame($id, $read()['id']);
             self::assertSame(0, $read()['autoResumeAttempts']);
             $this->evalWp('$s=get_option("wrb_live_operation"); $s["transferStoppedAt"]=time()-3600;'
+                .'update_option("wrb_live_operation",$s,false); delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $beforeDeadline = $read();
+            $tick();
+            self::assertSame($beforeDeadline, $read());
+            self::assertFileDoesNotExist($job.'/interrupted-operation.json');
+            $wait = $this->evalWp('echo json_encode(get_option("wrb_live_schedule_runner"));');
+            self::assertSame('storage_wait', $wait['lastResult']);
+            $this->evalWp('$s=get_option("wrb_live_operation"); $s["autoResumeAt"]=time()-1;'
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
         }
         if ($fault === 'nullCheckpoint') { file_put_contents($job.'/job.json', 'null'); }
@@ -387,7 +398,7 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             $before=$read();
         }
         $checkpoint=hash_file('sha256',$job.'/job.json');
-        $mustResume=in_array($fault,['legacy','terminated'],true);
+        $mustResume=in_array($fault,['legacy','terminated','longRetry'],true);
         if (!$mustResume) {
             $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
         }

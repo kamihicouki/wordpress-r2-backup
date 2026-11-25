@@ -119,9 +119,11 @@ try {
                         wp_cache_delete('wrb_live_operation', 'options'); wp_cache_delete('notoptions', 'options');
                         $active = get_option('wrb_live_operation', null);
                         $busy = is_array($active) && in_array($active['status'] ?? '', ['queued', 'capturing', 'uploading'], true);
-                        $state['status'] = $state['lastResult'] = $busy ? 'skipped' : 'failed';
-                        $state['message'] = $busy ? '未完了のバックアップがあるため、この予定の実行を見送りました。'
-                            : '起動依頼を確認できません。自動再試行せず、バックアップの状態を確認してください。';
+                        $waiting = $busy && is_int($active['autoResumeAt'] ?? null) && $active['autoResumeAt'] > $now->getTimestamp();
+                        $state['status'] = $state['lastResult'] = $waiting ? 'storage_wait' : ($busy ? 'skipped' : 'failed');
+                        $state['message'] = !$busy ? '起動依頼を確認できません。自動再試行せず、バックアップの状態を確認してください。'
+                            : ($waiting ? '保存先への再試行時刻に達していないため、定期実行を見送りました。'
+                                : '未完了のバックアップがあるため、この予定の実行を見送りました。');
                     }
                 }
             } else {
