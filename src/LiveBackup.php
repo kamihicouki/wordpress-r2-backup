@@ -135,15 +135,22 @@ final class LiveBackup
                 // The journal is advisory. Preserve the operation data if its files can still be written.
                 $run = null;
             }
-            if ($run !== null && (($run['source'] ?? '') !== 'scheduled' || ($run['snapshotId'] ?? null) !== $state['snapshotId']
-                || ($run['schedule']['revision'] ?? null) !== $state['scheduleRevision'])) { return; }
+            $historyUpdatedAt = $run['updatedAt'] ?? null;
+            if ($run !== null) {
+                if (($run['snapshotId'] ?? null) !== $state['snapshotId']) { return; }
+                if (($run['source'] ?? null) === 'unknown' && !isset($run['schedule']) && !isset($run['scheduledAt'])) {
+                    // A transfer event can recreate a row without its original provenance. Only permit handoff.
+                    $run = null;
+                } elseif (($run['source'] ?? null) !== 'scheduled'
+                    || ($run['schedule']['revision'] ?? null) !== $state['scheduleRevision']) { return; }
+            }
             // An old run can outlast the journal. Its actual start is a conservative bound on the original slot.
             $previousSlot = $run['scheduledAt'] ?? $state['scheduledSlot'] ?? $state['startedAt'] ?? null;
             if (!is_string($previousSlot) || !preg_match('/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/D', $previousSlot)) { return; }
             $events = array_column($run['events'] ?? [], 'code');
             // Old releases did not persist manual takeover in the operation option.
             $manual = !empty($state['manualResume']) || in_array('resume_queued', $events, true);
-            $recent = strtotime((string) ($run['updatedAt'] ?? $state['startedAt'] ?? ''));
+            $recent = strtotime((string) ($historyUpdatedAt ?? $state['startedAt'] ?? ''));
             if ($recent === false) { return; }
             // Protect the gap between ticket issuance and the child acquiring runner.lock, even without the journal.
             $recent = max($recent, (int) ($state['queuedAt'] ?? 0), (int) ($state['transferStoppedAt'] ?? 0));

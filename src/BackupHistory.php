@@ -141,10 +141,14 @@ final class BackupHistory
         $this->change(static function (array &$runs) use ($state, $code, $bytes, $id, $httpStatus): bool {
             $index = self::index($runs, $id);
             $run = $index === null ? self::newRun($id, $state, 'unknown', null) : $runs[$index];
-            if ($index === null && $code === 'scheduled_released' && self::isTime($state['scheduledSlot'] ?? null) && self::isId($state['scheduleRevision'] ?? null)) {
+            if ($code === 'scheduled_released' && $run['source'] === 'unknown'
+                && self::isId($state['scheduleRevision'] ?? null) && ($run['snapshotId'] ?? $state['snapshotId']) === $state['snapshotId']) {
                 $run['source'] = 'scheduled';
-                $run['scheduledAt'] = $state['scheduledSlot'];
-                $run['schedule'] = ['slot' => $state['scheduledSlot'], 'revision' => $state['scheduleRevision']];
+                $run['schedule'] = ['revision' => $state['scheduleRevision']];
+                if (self::isTime($state['scheduledSlot'] ?? null)) {
+                    $run['scheduledAt'] = $state['scheduledSlot'];
+                    $run['schedule']['slot'] = $state['scheduledSlot'];
+                }
             }
             if ($run['status'] === 'cancelled' || ($run['status'] === 'complete' && $code !== 'retention_failed')) { return false; }
             if (in_array($code, ['launch_failed', 'resume_failed'], true) && $index !== null

@@ -327,7 +327,8 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         }
         $failure = ['revision'=>'terminated', 'settings'=>'terminated', 'manual'=>'terminated', 'legacy403'=>'forbidden',
             'missingHistory'=>'forbidden', 'legacyMissingHistory'=>'forbidden', 'corruptHistory'=>'forbidden',
-            'longRetry'=>'persistent', 'nullCheckpoint'=>'terminated', 'damaged'=>'terminated', 'legacy'=>'persistent', 'exhausted'=>'persistent'][$fault] ?? $fault;
+            'longRetry'=>'persistent', 'recreatedHistory'=>'forbidden', 'nullCheckpoint'=>'terminated', 'damaged'=>'terminated', 'legacy'=>'persistent', 'exhausted'=>'persistent'][$fault] ?? $fault;
+        if ($fault === 'recreatedHistory') { unlink($workspace.'/backup-history.json'); }
         $worker('step', $failure);
         if ($fault === 'revision') {
             $this->evalWp('$c=get_option("wrb_live_schedule"); $c["revision"]=str_repeat("d",64); update_option("wrb_live_schedule",$c,false); echo "{}";');
@@ -339,7 +340,13 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $data=json_decode(file_get_contents($journal),true,16,JSON_THROW_ON_ERROR);
         $run=&$data['runs'][0];
         $previous=gmdate('Y-m-d\TH:i:s\Z',time()-3600);
-        $run['updatedAt']=$run['scheduledAt']=$run['schedule']['slot']=$previous;
+        $run['updatedAt'] = $previous;
+        if ($fault === 'recreatedHistory') {
+            self::assertSame('unknown', $run['source']);
+            self::assertArrayNotHasKey('schedule', $run);
+        } else {
+            $run['scheduledAt'] = $run['schedule']['slot'] = $previous;
+        }
         $last=count($run['events'])-1;
         $run['events'][$last]['at']=$previous;
         if (in_array($fault, ['legacy', 'legacy403', 'legacyMissingHistory'], true)) {
@@ -347,11 +354,11 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             $this->evalWp('$s=get_option("wrb_live_operation"); unset($s["autoResumeAt"],$s["scheduledSlot"],$s["transferStopped"],$s["transferStoppedAt"],$s["localRetentionDays"]);'
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
         }
-        if (in_array($fault, ['legacyMissingHistory', 'missingHistory', 'corruptHistory'], true)) {
+        if (in_array($fault, ['legacyMissingHistory', 'missingHistory', 'corruptHistory', 'recreatedHistory'], true)) {
             self::assertTrue(touch($job.'/job.json', time()-3600));
             if ($fault === 'legacyMissingHistory') { $data['runs'] = []; }
         }
-        if (in_array($fault, ['missingHistory', 'corruptHistory'], true)) {
+        if (in_array($fault, ['missingHistory', 'corruptHistory', 'recreatedHistory'], true)) {
             if ($fault === 'missingHistory') { $data['runs'] = []; }
             $this->evalWp('$s=get_option("wrb_live_operation"); $s["scheduledSlot"]=$s["startedAt"]='.var_export($previous,true).';'
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
@@ -449,7 +456,7 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
 
     public function interruptedSlots(): array
     {
-        return [['terminated'], ['forbidden'], ['exhausted'], ['legacy'], ['settings'], ['revision'], ['legacy403'], ['missingHistory'], ['legacyMissingHistory'], ['corruptHistory'], ['longRetry'], ['nullCheckpoint'], ['damaged'], ['manual']];
+        return [['terminated'], ['forbidden'], ['exhausted'], ['legacy'], ['settings'], ['revision'], ['legacy403'], ['missingHistory'], ['legacyMissingHistory'], ['corruptHistory'], ['longRetry'], ['nullCheckpoint'], ['damaged'], ['manual'], ['recreatedHistory']];
     }
 
     public function testPersistentFailuresCanOnlyOccupyTwoLocalWorkspaces(): void
