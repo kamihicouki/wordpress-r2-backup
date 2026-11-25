@@ -525,4 +525,58 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertSame('capture_low_space',end($paused['history']['events'])['code']);
     }
 
+    public function testThreeFailedCapturesPreservePartialCiphertextAndStayWithinTheLimit(): void
+    {
+        [$plugin,$config]=$this->prepare();
+        $scope=$this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo json_encode(["path"=>WordPressR2Backup\LiveSettings::workspace()]);')['path'];
+        $mu=$this->wp->root().'/wp-content/mu-plugins'; self::assertTrue(mkdir($mu,0700));
+        // age publishes ciphertext atomically with link(). Fail the next encryption after one real file is durable.
+        $fault=$this->scratch.'/fail-capture'; touch($fault);
+        file_put_contents($mu.'/fail-capture.php','<?php namespace WordPressR2Backup; function link($source,$destination) { static $n=0;'
+            .'if (is_file('.var_export($fault,true).') && str_ends_with($destination,".age") && ++$n===2) return false;'
+            .'return \\link($source,$destination); }');
+        $tick=function () use ($plugin): array {
+            $r=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
+            self::assertSame(0,$r['exit'],$r['err']);
+            return $this->evalWp('echo json_encode(["runner"=>get_option("wrb_live_schedule_runner"),"active"=>get_option("wrb_live_operation")]);');
+        };
+        $slot=function () use ($tick,$config): array {
+            $config['revision']=bin2hex(random_bytes(32)); $config['time']=gmdate('H:i');
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); update_option("wrb_live_schedule",'.var_export($config,true).',false); echo "{}";');
+            return $tick();
+        };
+        $failed=[];
+        for ($attempt=0;$attempt<3;++$attempt) {
+            $start=$slot(); self::assertSame('started',$start['runner']['lastResult']);
+            $id=$start['active']['id']; $directory=$scope.'/job-'.$id;
+            $finish=$this->evalWp('$b=new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load());'
+                .'try {$b->begin($b->state()["launchId"]);} catch (RuntimeException $e) { }'
+                .'echo json_encode(["state"=>$b->state(),"history"=>(new WordPressR2Backup\BackupHistory($b->workspace()))->find('.var_export($id,true).')]);');
+            self::assertSame('failed',$finish['state']['status']);
+            self::assertSame('capture_failed',end($finish['history']['events'])['code']);
+            self::assertFileExists($directory.'/interrupted-operation.json');
+            $cipher=[];
+            foreach (new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory,\FilesystemIterator::SKIP_DOTS)) as $file) {
+                if ($file->isFile() && str_ends_with($file->getFilename(),'.age')) { $cipher[]=$file->getPathname(); }
+            }
+            self::assertNotEmpty($cipher); self::assertGreaterThan(0,filesize($cipher[0]));
+            $failed[$directory]=[$cipher[0],hash_file('sha256',$cipher[0])];
+            self::assertLessThanOrEqual(2,count(glob($scope.'/job-*')));
+            if ($attempt===1 || $attempt===2) {
+                $blocked=$slot(); self::assertSame('skipped',$blocked['runner']['lastResult']);
+                self::assertSame($id,$blocked['active']['id']); self::assertCount(2,glob($scope.'/job-*'));
+                foreach ($failed as [$file,$hash]) { self::assertSame($hash,hash_file('sha256',$file)); }
+                $old=array_key_first($failed); touch($old.'/interrupted-operation.json',time()-31*86400);
+                $tick(); self::assertDirectoryDoesNotExist($old); unset($failed[$old]);
+            }
+        }
+        unlink($fault); $healthy=$slot(); self::assertSame('started',$healthy['runner']['lastResult']);
+        $store=$this->scratch.'/healthy-r2'; self::assertTrue(mkdir($store,0700));
+        $done=$this->evalWp('$directory='.var_export($store,true).'; $action="resume"; $fault="healthy";'
+            .'require '.var_export(__DIR__.'/fixtures/scheduled-cipher-put.php',true).';');
+        self::assertSame('complete',$done['state']['status']); self::assertContains('final_verification',array_column($done['events'],'code'));
+    }
+
 }
