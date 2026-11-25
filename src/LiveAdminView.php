@@ -328,7 +328,20 @@ final class LiveAdminView
         }
         if ($seen !== null) { echo '<p>最終の起動確認: ' . esc_html($seen) . '（UTC）。起動確認だけでは定期実行の登録は確認できません。</p>'; }
         if ($attempt !== null && ($runner['lastResult'] ?? null) === 'unavailable') { echo '<p>前回の予定: ' . esc_html($attempt) . '（UTC）。自動取得は実行されませんでした。</p>'; }
-        if ($attempt !== null && ($runner['lastResult'] ?? null) === 'skipped') { echo '<p>前回の予定: ' . esc_html($attempt) . '（UTC）。ほかのバックアップが進行中のため見送りました。</p>'; }
+        $lastResult = $runner['lastResult'] ?? null;
+        $message = is_string($runner['message'] ?? null) ? $runner['message'] : '';
+        if ($attempt !== null && $lastResult === 'skipped') {
+            $capacity = [ScheduledStorageLimit::countLimit()->getMessage(), ScheduledStorageLimit::lowSpace()->getMessage()];
+            $reason = in_array($message, $capacity, true) ? $message : 'ほかのバックアップが進行中のため見送りました。';
+            echo '<p>前回の予定: ' . esc_html($attempt) . '（UTC）。' . esc_html($reason) . '</p>';
+        }
+        if ($lastResult === 'storage_wait') {
+            $prefix = $attempt === null ? '' : '前回の予定: ' . $attempt . '（UTC）。';
+            echo '<p>' . esc_html($prefix . ($message !== '' ? $message : ScheduledStorageLimit::storageWait()->getMessage())) . '</p>';
+        } elseif (str_starts_with($message, 'R2保存先')) {
+            // A wait discovered while resuming between slots only updates the message, preserving the previous slot result.
+            echo '<p>転送の再開確認: ' . esc_html($message) . '</p>';
+        }
         if ($attempt !== null && ($runner['lastResult'] ?? null) === 'started') { echo '<p>前回の予定: ' . esc_html($attempt) . '（UTC）。起動依頼を受け付けました。バックアップの完了は別途確認してください。</p>'; }
         if ($attempt !== null && in_array($runner['lastResult'] ?? null, ['failed', 'interrupted', 'claimed'], true)) { echo '<p>前回の予定: ' . esc_html($attempt) . '（UTC）。起動状況を確認できません。自動再試行せず、バックアップの状態を確認してください。</p>'; }
         if ($attempt !== null && ($runner['lastResult'] ?? null) === 'config_changed') { echo '<p>前回の予定: ' . esc_html($attempt) . '（UTC）。設定が変更されたため開始しませんでした。</p>'; }
