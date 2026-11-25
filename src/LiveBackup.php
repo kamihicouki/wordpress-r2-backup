@@ -378,6 +378,7 @@ final class LiveBackup
                     ++$state['autoResumeAttempts'];
                 }
                 if (!is_array($state) || $state['status'] !== 'uploading') { throw new \RuntimeException('転送を再開する操作がありません。'); }
+                if (!$automatic) { $this->repository->assertDestinationAvailable(time()); }
                 unset($state['autoResumeAt'], $state['transferStopped'], $state['transferStoppedAt']);
                 if (!$automatic && isset($state['scheduleRevision'])) { $state['manualResume'] = true; }
                 $state['resumeStatus'] = 'uploading';
@@ -385,7 +386,7 @@ final class LiveBackup
                 if (is_array($state) && !in_array($state['status'], ['complete', 'failed', 'cancelled'], true)) { throw new \RuntimeException('未完了のバックアップがあります。転送を再開してください。'); }
                 if (@lstat(rtrim(ABSPATH, '/') . '/.maintenance') !== false) { throw new \RuntimeException('保守状態が残っています。未完了の実行を取り消してから取得してください。'); }
                 $scheduled = $mode === 'online' && isset($schedule['revision']);
-                if ($scheduled) { $this->repository->assertDestinationAvailable(time()); }
+                $this->repository->assertDestinationAvailable(time());
                 $estimate = $scheduled ? $this->assertScheduledCapacity($state) : 0;
                 $state = ['id' => bin2hex(random_bytes(32)), 'snapshotId' => bin2hex(random_bytes(32)), 'completed' => 0, 'total' => 0, 'startedAt' => gmdate('Y-m-d\TH:i:s\Z')];
                 if ($scheduled) {
@@ -494,6 +495,11 @@ final class LiveBackup
             $queued = $launchId !== null && $existing !== null && $existing['status'] === 'queued' && hash_equals((string) ($existing['launchId'] ?? ''), $launchId) && empty($existing['resumeStatus']);
             if ($launchId !== null && !$queued) { throw new \RuntimeException('起動待ちの操作が取り消されたか変更されています。'); }
             if ($existing !== null && !$queued && !in_array($existing['status'], ['complete', 'failed', 'cancelled'], true)) { throw new \RuntimeException('未完了のバックアップがあります。転送を再開してください。'); }
+            try { $this->repository->assertDestinationAvailable(time()); }
+            catch (ScheduledStorageLimit $error) {
+                if ($queued) { $state = $existing; }
+                throw $error;
+            }
             $binding = $queued ? $existing : ['consistencyMode' => 'maintenance', 'settingsDigest' => $this->fullSettingsDigest($this->settings), 'sharingDigest' => $this->sharingDigest()];
             $mode = $binding['consistencyMode'] ?? null;
             if (!in_array($mode, ['maintenance', 'online'], true)) { throw new \RuntimeException('取得方式が不正です。'); }
@@ -721,6 +727,9 @@ final class LiveBackup
             $current['transferStoppedAt'] = time();
             unset($current['autoResumeAt']);
             $notBefore = $error instanceof R2HttpException ? $error->retryNotBefore() : null;
+            if ($error instanceof ScheduledStorageLimit && $error->outcome() === 'storage_wait') {
+                $notBefore = $error->deadline();
+            }
             if (empty($current['manualResume']) && (($error instanceof R2TransportException && $error->isTransient()) || $notBefore !== null)) {
                 $attempts = $current['autoResumeAttempts'] ?? null;
                 if (is_int($attempts) && isset(self::SCHEDULED_RETRY_DELAYS[$attempts])) {

@@ -263,6 +263,51 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertSame('schedule_storage_wait', $result['history']['events'][0]['code']);
         self::assertSame([], $result['tickets']);
     }
+    public function testAnIndependentStorageWaitResumesTheSameScheduledTransfer(): void
+    {
+        [$plugin] = $this->prepare();
+        $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo "{}";');
+        $store = $this->scratch.'/rate-limited';
+        self::assertTrue(mkdir($store, 0700));
+        $tick = function () use ($plugin): void {
+            $result = $this->process([PHP_BINARY, '-d', 'sys_temp_dir='.$this->scratch, $plugin.'/schedule.php', $this->wp->root()]);
+            self::assertSame(0, $result['exit'], $result['err']);
+        };
+        $worker = function (string $action) use ($store): array {
+            return $this->evalWp('$directory='.var_export($store, true).'; $action='.var_export($action, true).'; $fault="healthy";'
+                .'require '.var_export(__DIR__.'/fixtures/scheduled-cipher-put.php', true).';');
+        };
+        $tick();
+        $first = $worker('capture')['state'];
+        self::assertSame('uploading', $first['status']);
+        self::assertGreaterThan(0, $first['completed']);
+        $window = $this->evalWp('$settings=WordPressR2Backup\LiveSettings::load(); $workspace=WordPressR2Backup\LiveSettings::workspace();'
+            .'$retry=new WordPressR2Backup\R2DestinationRetry($workspace,$settings["accountId"],$settings["bucket"]);'
+            .'$deadline=time()+3600; $retry->record($deadline);'
+            .'echo json_encode(["deadline"=>$deadline,"path"=>$workspace."/r2-retry-".hash("sha256",$settings["accountId"]."/".$settings["bucket"])]);');
+        $wait = $worker('step');
+        self::assertSame($first['id'], $wait['state']['id']);
+        self::assertSame($first['completed'], $wait['state']['completed']);
+        self::assertSame($window['deadline'], $wait['state']['autoResumeAt']);
+        self::assertSame(0, $wait['state']['autoResumeAttempts']);
+        self::assertSame('auto_resume_waiting', end($wait['events'])['code']);
+        $tick();
+        $waitingState = $this->evalWp('echo json_encode(get_option("wrb_live_operation"));');
+        self::assertSame($wait['state'], $waitingState);
+        file_put_contents($window['path'], (time()-1)."\n");
+        $this->evalWp('$s=get_option("wrb_live_operation"); $s["autoResumeAt"]=time()-1;'
+            .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        $tick();
+        $done = $worker('resume');
+        self::assertNull($done['error']);
+        self::assertSame($first['id'], $done['state']['id']);
+        self::assertSame($first['snapshotId'], $done['state']['snapshotId']);
+        self::assertSame('complete', $done['state']['status']);
+        self::assertContains('final_verification', array_column($done['events'], 'code'));
+    }
+
     public function testHttp500ConditionalPutResumesOnlyWithVerifiedCiphertextAndWithinBudget(): void
     {
         [$plugin,$config] = $this->prepare();
