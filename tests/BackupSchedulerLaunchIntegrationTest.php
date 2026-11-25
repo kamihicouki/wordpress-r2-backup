@@ -447,6 +447,10 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $workspace = $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
             .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
             .'WordPressR2Backup\LiveSettings::save($s); echo json_encode(["path"=>WordPressR2Backup\LiveSettings::workspace()]);')['path'];
+        $pressure=$this->scratch.'/pressured';
+        $mu=$this->wp->root().'/wp-content/mu-plugins'; self::assertTrue(mkdir($mu,0700));
+        file_put_contents($mu.'/capacity.php','<?php namespace WordPressR2Backup; function disk_free_space($path) {'
+            .'return is_file('.var_export($pressure,true).') ? 4096 : \\disk_free_space($path); }');
         $store = $this->scratch.'/cipher-store'; self::assertTrue(mkdir($store,0700));
         $legacy = $workspace.'/job-'.str_repeat('f',64); self::assertTrue(mkdir($legacy,0700));
         file_put_contents($legacy.'/existing.age','protected');
@@ -496,6 +500,15 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         }
         self::assertSame($firstSum,hash_file('sha256',$firstDir.'/job.json')); self::assertSame($secondSum,hash_file('sha256',$secondDir.'/job.json'));
         self::assertSame($remoteBefore,glob($store.'/*'));
+        // Both admission limits are active. Resuming the current transfer still makes no new capture or workspace.
+        touch($pressure);
+        $resumed=$this->evalWp('echo json_encode((new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()))->resume());');
+        self::assertSame($second['snapshotId'],$resumed['snapshotId']); self::assertSame($second['completed'],$resumed['completed']);
+        $thirdFailure=$worker('resume','forbidden');
+        self::assertSame('R2 returned HTTP 403.',$thirdFailure['error']);
+        self::assertSame($second['id'],$thirdFailure['state']['id']);
+        self::assertSame($secondSum,hash_file('sha256',$secondDir.'/job.json'));
+        unlink($pressure);
         touch($firstDir.'/interrupted-operation.json',time()-31*86400);
         $tick(); self::assertDirectoryDoesNotExist($firstDir); self::assertFileExists($secondDir.'/job.json');
         $nextSlot(); self::assertNotSame($second['id'],$read()['id']);
