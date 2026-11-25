@@ -31,10 +31,11 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
     private $wait;
     /** Monotonic nanoseconds. Parallel reads decide that a retry delay has passed only from this time. */
     private $ticks;
+    private ?R2DestinationRetry $destinationRetry = null;
     /** Reuse the connection within one repository instance, while resetting all request options between uses. */
     private $curlHandle = null;
 
-    public function __construct(array $connection, ?callable $transport = null, ?callable $clock = null, ?callable $wait = null, ?callable $ticks = null)
+    public function __construct(array $connection, ?callable $transport = null, ?callable $clock = null, ?callable $wait = null, ?callable $ticks = null, ?string $retryWorkspace = null)
     {
         self::fields($connection, ['accountId', 'bucket', 'accessKeyId', 'secretAccessKey', 'unitId']);
         foreach ($connection as $value) { if (!is_string($value)) { throw new RuntimeException('Invalid R2 connection.'); } }
@@ -50,6 +51,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         $this->clock = $clock ?? static fn (): int => time();
         $this->wait = $wait ?? static function (int $seconds): void { sleep($seconds); };
         $this->ticks = $ticks ?? static fn (): int => hrtime(true);
+        if ($retryWorkspace !== null) { $this->bindRetryWorkspace($retryWorkspace); }
     }
 
     public static function fromFile(string $privatepath): self
@@ -88,6 +90,23 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
     public function storageScope(): array
     {
         return ['accountId' => $this->connection['accountId'], 'bucket' => $this->connection['bucket'], 'unitId' => $this->unitId()];
+    }
+
+    public function bindRetryWorkspace(string $workspace): void
+    {
+        $this->destinationRetry = new R2DestinationRetry($workspace, $this->connection['accountId'], $this->connection['bucket']);
+    }
+
+    public function assertDestinationAvailable(int $now): void
+    {
+        if ($this->destinationRetry !== null) { $this->destinationRetry->assertAvailable($now); }
+    }
+
+    private function rememberRetryAfter(int $status, ?string $header): void
+    {
+        if ($this->destinationRetry === null || $header === null || !in_array($status, [429, 503], true)) { return; }
+        $deadline = (new R2HttpException($status, $header))->retryNotBefore();
+        if ($deadline === null || $deadline > time()) { $this->destinationRetry->record($deadline ?? PHP_INT_MAX); }
     }
 
     public function putNew(string $objectKey, string $cipherFile): array
@@ -616,12 +635,13 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
     {
         $prepared = $this->prepare($method, $key, $query, $body, $bodyBytes, $payloadHash, $extraHeaders, $consume, $limit);
         try { $response = $this->transport !== null ? ($this->transport)($prepared['request'], $prepared['consume']) : $this->curl($prepared['request'], $prepared['consume']); }
+        catch (ScheduledStorageLimit $wait) { throw $wait; }
         catch (R2TransportException $failure) { throw self::stoppedHere($prepared['flags'], $failure); }
         catch (\Throwable $failure) {
             error_log(sprintf('wrb-r2-transport method=%s errno=none local=yes', $method));
             throw new RuntimeException('R2 transport failed.');
         }
-        return self::accepted($method, $prepared['flags'], $response, $allowed);
+        return $this->accepted($method, $prepared['flags'], $response, $allowed);
     }
 
     /** Signs one attempt now and bounds what its response may deliver. */
@@ -634,6 +654,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         $queryString = http_build_query($query, '', '&', PHP_QUERY_RFC3986);
         $timestamp = ($this->clock)();
         if (!is_int($timestamp) || $timestamp < 0) { throw new RuntimeException('Invalid R2 signing clock.'); }
+        $this->assertDestinationAvailable($timestamp);
         $date = gmdate('Ymd\THis\Z', $timestamp); $day = substr($date, 0, 8);
         $headers = $extraHeaders + ['host' => $host, 'x-amz-content-sha256' => $payloadHash, 'x-amz-date' => $date];
         if ($body !== null) { $headers['content-length'] = (string) $bodyBytes; }
@@ -674,7 +695,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         return $failure;
     }
 
-    private static function accepted(string $method, \stdClass $flags, $response, array $allowed): array
+    private function accepted(string $method, \stdClass $flags, $response, array $allowed): array
     {
         $status = is_array($response) ? ($response['status'] ?? null) : null;
         $validStatus = is_int($status) && $status >= 100 && $status <= 599;
@@ -682,7 +703,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         if ($flags->overflow) { $reason = 'response_limit'; }
         elseif ($flags->refused) { $reason = 'local_refusal'; }
         elseif (!$validStatus || !is_array($response['headers'] ?? null)) { $reason = 'invalid_response'; }
-        if ($reason !== null) {
+        if ($reason !== null && (!$validStatus || !is_array($response['headers'] ?? null))) {
             error_log(sprintf('wrb-r2-response method=%s reason=%s status=%d', $method, $reason, $validStatus ? $status : 0));
             throw new RuntimeException('R2 request failed or exceeded its response limit.');
         }
@@ -695,6 +716,11 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
             $name = strtolower($name);
             if ($name === 'retry-after' && isset($normalized[$name])) { $normalized[$name] = ''; }
             else { $normalized[$name] = trim($value); }
+        }
+        if (($response['retryObserved'] ?? false) !== true) { $this->rememberRetryAfter($status, $normalized['retry-after'] ?? null); }
+        if ($reason !== null) {
+            error_log(sprintf('wrb-r2-response method=%s reason=%s status=%d', $method, $reason, $status));
+            throw new RuntimeException('R2 request failed or exceeded its response limit.');
         }
         if (!in_array($status, $allowed, true)) {
             error_log(sprintf('wrb-r2-response method=%s reason=http_status status=%d', $method, $status));
@@ -712,11 +738,11 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         }
         $curl = $this->curlHandle;
         curl_reset($curl);
-        $received = (object) ['headers' => [], 'bytes' => 0];
+        $received = (object) ['headers' => [], 'bytes' => 0, 'status' => 0, 'retryObserved' => false];
         try {
-            if (!curl_setopt_array($curl, self::curlOptions($request, $consume, $received))) { throw new RuntimeException('Cannot configure R2 transport.'); }
+            if (!curl_setopt_array($curl, $this->curlOptions($request, $consume, $received))) { throw new RuntimeException('Cannot configure R2 transport.'); }
             if (curl_exec($curl) === false) { throw new R2TransportException(curl_errno($curl)); }
-            return ['status' => (int) curl_getinfo($curl, CURLINFO_HTTP_CODE), 'headers' => $received->headers];
+            return ['status' => (int) curl_getinfo($curl, CURLINFO_HTTP_CODE), 'headers' => $received->headers, 'retryObserved' => $received->retryObserved];
         } finally { self::releaseHandle($curl); }
     }
 
@@ -750,9 +776,9 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
                         if ($handle === false) { throw new RuntimeException('Cannot initialize R2 transport.'); }
                         $handles[] = $handle;
                     } else { $handle = array_pop($free); }
-                    $received = (object) ['headers' => [], 'bytes' => 0];
+                    $received = (object) ['headers' => [], 'bytes' => 0, 'status' => 0, 'retryObserved' => false];
                     curl_reset($handle);
-                    if (!curl_setopt_array($handle, self::curlOptions($prepared['request'], $prepared['consume'], $received)) || curl_multi_add_handle($multi, $handle) !== CURLM_OK) {
+                    if (!curl_setopt_array($handle, $this->curlOptions($prepared['request'], $prepared['consume'], $received)) || curl_multi_add_handle($multi, $handle) !== CURLM_OK) {
                         self::releaseHandle($handle); throw new RuntimeException('Cannot configure R2 transport.');
                     }
                     $active[] = ['index' => $index, 'handle' => $handle, 'flags' => $prepared['flags'], 'received' => $received];
@@ -768,7 +794,8 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
                 }
                 try {
                     do { $code = curl_multi_exec($multi, $running); } while ($code === CURLM_CALL_MULTI_PERFORM);
-                } catch (\Throwable $failure) {
+                } catch (ScheduledStorageLimit $wait) { throw $wait; }
+                catch (\Throwable $failure) {
                     error_log(sprintf('wrb-r2-transport method=%s errno=none local=yes', $method));
                     throw new RuntimeException('R2 transport failed.');
                 }
@@ -784,7 +811,8 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
                     self::releaseHandle($entry['handle']); $free[] = $entry['handle'];
                     $index = $entry['index'];
                     if ((int) $done['result'] === 0) {
-                        $results[$index] = self::accepted($method, $entry['flags'], ['status' => $status, 'headers' => $entry['received']->headers], $specs[$index]['allowed']);
+                        $results[$index] = $this->accepted($method, $entry['flags'], ['status' => $status, 'headers' => $entry['received']->headers,
+                            'retryObserved' => $entry['received']->retryObserved], $specs[$index]['allowed']);
                         continue;
                     }
                     $failure = self::stoppedHere($entry['flags'], new R2TransportException((int) $done['result']));
@@ -808,7 +836,7 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
         return $ordered;
     }
 
-    private static function curlOptions(array $request, callable $consume, \stdClass $received): array
+    private function curlOptions(array $request, callable $consume, \stdClass $received): array
     {
         $httpHeaders = [];
         foreach ($request['headers'] as $name => $value) { $httpHeaders[] = $name . ': ' . $value; }
@@ -819,11 +847,19 @@ final class DirectR2Repository implements ObjectReader, ObjectWriter
             CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS, CURLOPT_NETRC => CURL_NETRC_IGNORED,
             CURLOPT_CONNECTTIMEOUT => 15, CURLOPT_TIMEOUT => 3600,
             CURLOPT_WRITEFUNCTION => static fn ($handle, string $chunk): int => $consume($chunk),
-            CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use ($received): int {
+            CURLOPT_HEADERFUNCTION => function ($handle, string $line) use ($received): int {
                 $length = strlen($line); $received->bytes += $length;
                 if ($received->bytes > 65536) { return 0; }
-                if (preg_match('~^HTTP/~i', $line)) { $received->headers = []; }
-                elseif (strpos($line, ':') !== false) {
+                if (preg_match('~^HTTP/~i', $line)) {
+                    $received->headers = [];
+                    $received->status = preg_match('~^HTTP/\S+ ([0-9]{3})(?:\s|$)~i', $line, $match) ? (int) $match[1] : 0;
+                } elseif ($line === "\r\n" || $line === "\n") {
+                    // A complete server header remains valid even if the response body later fails or a sibling aborts.
+                    if (!$received->retryObserved && isset($received->headers['retry-after']) && in_array($received->status, [429, 503], true)) {
+                        $this->rememberRetryAfter($received->status, $received->headers['retry-after']);
+                        $received->retryObserved = true;
+                    }
+                } elseif (strpos($line, ':') !== false) {
                     [$name, $value] = explode(':', $line, 2); $name = strtolower(trim($name));
                     if (isset($received->headers[$name]) && $name === 'content-length') { return 0; }
                     if ($name === 'retry-after' && isset($received->headers[$name])) { $received->headers[$name] = ''; }
