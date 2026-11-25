@@ -10,6 +10,11 @@ final class BackupHistory
     private const MAX_BYTES = 3145728;
     // Preserve the journal format understood by earlier releases. Retry details refine existing events.
     private const RETRY_EVENTS = [
+        'schedule_retained_limit' => 'schedule_skipped',
+        'schedule_low_space' => 'schedule_skipped',
+        'capture_low_space' => 'capture_failed',
+        'capture_storage_wait' => 'capture_failed',
+        'schedule_storage_wait' => 'schedule_skipped',
         'legacy_http_retry' => 'transfer_connection',
         'worker_lost_waiting' => 'transfer_connection',
         'scheduled_released' => 'transfer_failed',
@@ -44,6 +49,11 @@ final class BackupHistory
         'capture_unsupported_engine' => ['failed', '保守なしで取得できない形式のデータベーステーブルがあり、取得を中止しました。'],
         'transfer_connection' => ['interrupted', 'R2への接続が途切れました。保存済みの位置から転送を再開できます。'],
         'transfer_failed' => ['interrupted', '転送または照合を完了できませんでした。保存済みの位置から転送を再開できます。'],
+        'schedule_retained_limit' => ['skipped', '未完了の定期バックアップが保管上限の2世代に達したため、新規取得を見送りました。実行履歴で中断原因を確認してください。転送可能な現在の世代は、原因を解消して「バックアップ設定」の「暗号文の転送を再開」を実行し、最終照合が完了すると枠が空きます。'],
+        'schedule_low_space' => ['skipped', '作業領域の空き容量を確保できないため、新規取得を見送りました。'],
+        'capture_storage_wait' => ['failed', 'R2保存先への再試行時刻まで通信を待機するため、今回の取得を停止しました。'],
+        'capture_low_space' => ['failed', '作業領域の空き容量を確保できないため、取得を停止しました。'],
+        'schedule_storage_wait' => ['skipped', '保存先への再試行時刻に達していないため、接続先への新しい定期実行も見送りました。'],
         'schedule_skipped' => ['skipped', '他のバックアップ処理があるため、定期実行を見送りました。'],
         'schedule_failed' => ['failed', '定期バックアップを起動できませんでした。'],
         'schedule_unavailable' => ['skipped', '実行に必要な設定または実行環境を確認できませんでした。'],
@@ -133,10 +143,15 @@ final class BackupHistory
         $this->change(static function (array &$runs) use ($state, $code, $bytes, $id, $httpStatus): bool {
             $index = self::index($runs, $id);
             $run = $index === null ? self::newRun($id, $state, 'unknown', null) : $runs[$index];
-            if ($index === null && $code === 'scheduled_released' && self::isTime($state['scheduledSlot'] ?? null) && self::isId($state['scheduleRevision'] ?? null)) {
+            if ($code === 'scheduled_released' && $run['source'] === 'unknown'
+                && self::isId($state['scheduleRevision'] ?? null) && self::isId($state['snapshotId'] ?? null)
+                && ($run['snapshotId'] ?? $state['snapshotId']) === $state['snapshotId']) {
                 $run['source'] = 'scheduled';
-                $run['scheduledAt'] = $state['scheduledSlot'];
-                $run['schedule'] = ['slot' => $state['scheduledSlot'], 'revision' => $state['scheduleRevision']];
+                $run['schedule'] = ['revision' => $state['scheduleRevision']];
+                if (self::isTime($state['scheduledSlot'] ?? null)) {
+                    $run['scheduledAt'] = $state['scheduledSlot'];
+                    $run['schedule']['slot'] = $state['scheduledSlot'];
+                }
             }
             if ($run['status'] === 'cancelled' || ($run['status'] === 'complete' && $code !== 'retention_failed')) { return false; }
             if (in_array($code, ['launch_failed', 'resume_failed'], true) && $index !== null
@@ -192,6 +207,9 @@ final class BackupHistory
 
     public static function captureError(\Throwable $error): string
     {
+        if ($error instanceof ScheduledStorageLimit) {
+            return $error->outcome() === 'storage_wait' ? 'capture_storage_wait' : 'capture_low_space';
+        }
         if ($error instanceof SourcePathCollision) { return 'capture_path_collision'; }
         if ($error instanceof SourcePathReviewRequired) { return 'capture_path_review'; }
         return $error instanceof UnsupportedOnlineDatabaseEngine ? 'capture_unsupported_engine' : 'capture_failed';

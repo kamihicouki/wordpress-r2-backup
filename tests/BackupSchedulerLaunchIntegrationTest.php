@@ -223,6 +223,12 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertSame($temporary,$read(), 'Retry-After must survive a new scheduler process');
         $dueNow();
         $tick();
+        self::assertSame('uploading', $read()['status'], 'An eligible operation must still respect the destination deadline');
+        self::assertSame(0, $read()['autoResumeAttempts']);
+        $this->evalWp('$s=WordPressR2Backup\LiveSettings::load();'
+            .'$marker=WordPressR2Backup\LiveSettings::workspace()."/r2-retry-".hash("sha256",$s["accountId"]."/".$s["bucket"]);'
+            .'if(!is_file($marker)) throw new RuntimeException("Expected retry marker"); file_put_contents($marker,(time()-1)."\n"); echo "{}";');
+        $tick();
         $recovered=$this->evalWp($worker.'$fault=0;'.$resumeWorker);
         self::assertSame('complete',$recovered['status']);
         self::assertSame($second['snapshotId'],$recovered['snapshotId']);
@@ -235,6 +241,73 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         self::assertContains('final_verification',$codes);
         self::assertSame('complete',end($codes));
     }
+
+    public function testDestinationThrottleBlocksTheNextSlotWithoutAnOperationRetryBudget(): void
+    {
+        [$plugin, $config] = $this->prepare();
+        $throttled = $this->evalWp('$settings=WordPressR2Backup\LiveSettings::load();'
+            .'$connection=array_intersect_key($settings,array_flip(["accountId","bucket","accessKeyId","secretAccessKey","unitId"]));'
+            .'$repository=new WordPressR2Backup\DirectR2Repository($connection,static fn()=>["status"=>429,"headers"=>["Retry-After"=>"3600"]]);'
+            .'$backup=new WordPressR2Backup\LiveBackup($settings,$repository);'
+            .'try {iterator_to_array($repository->listPackObjects(str_repeat("e",64)));} catch(WordPressR2Backup\R2HttpException $error) {$deadline=$error->retryNotBefore();}'
+            .'update_option("wrb_live_operation",["status"=>"failed"],false); echo json_encode(["deadline"=>$deadline??null]);');
+        self::assertNotNull($throttled['deadline']);
+        $run = $this->process([PHP_BINARY, '-d', 'sys_temp_dir='.$this->scratch, $plugin.'/schedule.php', $this->wp->root()]);
+        self::assertSame(0, $run['exit'], $run['err']);
+        $result = $this->evalWp('$workspace=WordPressR2Backup\LiveSettings::workspace();'
+            .'echo json_encode(["operation"=>get_option("wrb_live_operation"),"runner"=>get_option("wrb_live_schedule_runner"),'
+            .'"history"=>(new WordPressR2Backup\BackupHistory($workspace))->latest(),"tickets"=>glob($workspace."/launch-*.json")]);');
+        self::assertSame(['status' => 'failed'], $result['operation']);
+        self::assertSame('storage_wait', $result['runner']['lastResult']);
+        self::assertStringContainsString(gmdate('Y-m-d H:i:s', $throttled['deadline']), $result['runner']['message']);
+        self::assertSame('schedule_storage_wait', $result['history']['events'][0]['code']);
+        self::assertSame([], $result['tickets']);
+    }
+    public function testAnIndependentStorageWaitResumesTheSameScheduledTransfer(): void
+    {
+        [$plugin] = $this->prepare();
+        $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo "{}";');
+        $store = $this->scratch.'/rate-limited';
+        self::assertTrue(mkdir($store, 0700));
+        $tick = function () use ($plugin): void {
+            $result = $this->process([PHP_BINARY, '-d', 'sys_temp_dir='.$this->scratch, $plugin.'/schedule.php', $this->wp->root()]);
+            self::assertSame(0, $result['exit'], $result['err']);
+        };
+        $worker = function (string $action) use ($store): array {
+            return $this->evalWp('$directory='.var_export($store, true).'; $action='.var_export($action, true).'; $fault="healthy";'
+                .'require '.var_export(__DIR__.'/fixtures/scheduled-cipher-put.php', true).';');
+        };
+        $tick();
+        $first = $worker('capture')['state'];
+        self::assertSame('uploading', $first['status']);
+        self::assertGreaterThan(0, $first['completed']);
+        $window = $this->evalWp('$settings=WordPressR2Backup\LiveSettings::load(); $workspace=WordPressR2Backup\LiveSettings::workspace();'
+            .'$retry=new WordPressR2Backup\R2DestinationRetry($workspace,$settings["accountId"],$settings["bucket"]);'
+            .'$deadline=time()+3600; $retry->record($deadline);'
+            .'echo json_encode(["deadline"=>$deadline,"path"=>$workspace."/r2-retry-".hash("sha256",$settings["accountId"]."/".$settings["bucket"])]);');
+        $wait = $worker('step');
+        self::assertSame($first['id'], $wait['state']['id']);
+        self::assertSame($first['completed'], $wait['state']['completed']);
+        self::assertSame($window['deadline'], $wait['state']['autoResumeAt']);
+        self::assertSame(0, $wait['state']['autoResumeAttempts']);
+        self::assertSame('auto_resume_waiting', end($wait['events'])['code']);
+        $tick();
+        $waitingState = $this->evalWp('echo json_encode(get_option("wrb_live_operation"));');
+        self::assertSame($wait['state'], $waitingState);
+        file_put_contents($window['path'], (time()-1)."\n");
+        $this->evalWp('$s=get_option("wrb_live_operation"); $s["autoResumeAt"]=time()-1;'
+            .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        $tick();
+        $done = $worker('resume');
+        self::assertNull($done['error']);
+        self::assertSame($first['id'], $done['state']['id']);
+        self::assertSame($first['snapshotId'], $done['state']['snapshotId']);
+        self::assertSame('complete', $done['state']['status']);
+        self::assertContains('final_verification', array_column($done['events'], 'code'));
+    }
+
     public function testHttp500ConditionalPutResumesOnlyWithVerifiedCiphertextAndWithinBudget(): void
     {
         [$plugin,$config] = $this->prepare();
@@ -326,7 +399,9 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             $this->evalWp('$s=get_option("wrb_live_operation"); $s["autoResumeAttempts"]=3; update_option("wrb_live_operation",$s,false); echo "{}";');
         }
         $failure = ['revision'=>'terminated', 'settings'=>'terminated', 'manual'=>'terminated', 'legacy403'=>'forbidden',
-            'missingHistory'=>'forbidden', 'damaged'=>'terminated', 'legacy'=>'persistent', 'exhausted'=>'persistent'][$fault] ?? $fault;
+            'missingHistory'=>'forbidden', 'legacyMissingHistory'=>'forbidden', 'corruptHistory'=>'forbidden',
+            'longRetry'=>'persistent', 'recreatedHistory'=>'forbidden', 'nullCheckpoint'=>'terminated', 'damaged'=>'terminated', 'legacy'=>'persistent', 'exhausted'=>'persistent'][$fault] ?? $fault;
+        if ($fault === 'recreatedHistory') { unlink($workspace.'/backup-history.json'); }
         $worker('step', $failure);
         if ($fault === 'revision') {
             $this->evalWp('$c=get_option("wrb_live_schedule"); $c["revision"]=str_repeat("d",64); update_option("wrb_live_schedule",$c,false); echo "{}";');
@@ -338,25 +413,57 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
         $data=json_decode(file_get_contents($journal),true,16,JSON_THROW_ON_ERROR);
         $run=&$data['runs'][0];
         $previous=gmdate('Y-m-d\TH:i:s\Z',time()-3600);
-        $run['updatedAt']=$run['scheduledAt']=$run['schedule']['slot']=$previous;
+        $run['updatedAt'] = $previous;
+        if ($fault === 'recreatedHistory') {
+            self::assertSame('unknown', $run['source']);
+            self::assertArrayNotHasKey('schedule', $run);
+        } else {
+            $run['scheduledAt'] = $run['schedule']['slot'] = $previous;
+        }
         $last=count($run['events'])-1;
         $run['events'][$last]['at']=$previous;
-        if ($fault === 'legacy' || $fault === 'legacy403') {
+        if (in_array($fault, ['legacy', 'legacy403', 'legacyMissingHistory'], true)) {
             $run['events'][$last]=['at'=>$previous,'code'=>'transfer_failed','httpStatus'=>$fault==='legacy'?500:403];
-            $this->evalWp('$s=get_option("wrb_live_operation"); unset($s["autoResumeAt"],$s["scheduledSlot"],$s["transferStopped"],$s["localRetentionDays"]);'
+            $this->evalWp('$s=get_option("wrb_live_operation"); unset($s["autoResumeAt"],$s["scheduledSlot"],$s["transferStopped"],$s["transferStoppedAt"],$s["localRetentionDays"]);'
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
         }
-        if ($fault === 'missingHistory') {
-            $data['runs']=[];
+        if (in_array($fault, ['legacyMissingHistory', 'missingHistory', 'corruptHistory', 'recreatedHistory'], true)) {
+            self::assertTrue(touch($job.'/job.json', time()-3600));
+            if ($fault === 'legacyMissingHistory') { $data['runs'] = []; }
+        }
+        if (in_array($fault, ['missingHistory', 'corruptHistory', 'recreatedHistory'], true)) {
+            if ($fault === 'missingHistory') { $data['runs'] = []; }
             $this->evalWp('$s=get_option("wrb_live_operation"); $s["scheduledSlot"]=$s["startedAt"]='.var_export($previous,true).';'
                 .'update_option("wrb_live_operation",$s,false); echo "{}";');
         }
+        $this->evalWp('$s=get_option("wrb_live_operation"); $s["startedAt"]='.var_export($previous,true).';'
+            .'if(isset($s["transferStoppedAt"])) $s["transferStoppedAt"]=time()-3600;'
+            .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        if ($fault === 'longRetry') {
+            $this->evalWp('$s=get_option("wrb_live_operation"); $s["autoResumeAt"]=time()+86400; $s["transferStoppedAt"]=time()-180;'
+                .'update_option("wrb_live_operation",$s,false); delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $tick();
+            self::assertSame($id, $read()['id']);
+            self::assertSame(0, $read()['autoResumeAttempts']);
+            $this->evalWp('$s=get_option("wrb_live_operation"); $s["transferStoppedAt"]=time()-3600;'
+                .'update_option("wrb_live_operation",$s,false); delete_option("wrb_live_schedule_runner"); echo "{}";');
+            $beforeDeadline = $read();
+            $tick();
+            self::assertSame($beforeDeadline, $read());
+            self::assertFileDoesNotExist($job.'/interrupted-operation.json');
+            $wait = $this->evalWp('echo json_encode(get_option("wrb_live_schedule_runner"));');
+            self::assertSame('storage_wait', $wait['lastResult']);
+            $this->evalWp('$s=get_option("wrb_live_operation"); $s["autoResumeAt"]=time()-1;'
+                .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        }
+        if ($fault === 'nullCheckpoint') { file_put_contents($job.'/job.json', 'null'); }
         if ($fault === 'damaged') { unlink($job.'/capture-ready'); }
         if ($fault === 'manual') {
             $this->evalWp('(new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()))->resume(); echo "{}";');
             $run['events'][]=['at'=>$previous,'code'=>'resume_queued'];
         }
         file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
+        if ($fault === 'corruptHistory') { file_put_contents($journal, '{"corrupt":'); }
         $before=$read();
         if ($fault === 'manual') {
             // A newly queued manual resume is protected even before its worker takes the lock.
@@ -366,9 +473,12 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             $tick(); self::assertSame($before,$read()); self::assertFileDoesNotExist($job.'/interrupted-operation.json');
             $run['updatedAt']=$previous;
             file_put_contents($journal,json_encode($data,JSON_THROW_ON_ERROR));
+            $this->evalWp('$s=get_option("wrb_live_operation"); $s["queuedAt"]=time()-3600;'
+                .'update_option("wrb_live_operation",$s,false); echo "{}";');
+            $before=$read();
         }
         $checkpoint=hash_file('sha256',$job.'/job.json');
-        $mustResume=in_array($fault,['legacy','terminated'],true);
+        $mustResume=in_array($fault,['legacy','terminated','longRetry'],true);
         if (!$mustResume) {
             $this->evalWp('delete_option("wrb_live_schedule_runner"); echo "{}";');
         }
@@ -385,9 +495,15 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             self::assertNotSame($id,$queued['id']); self::assertNotSame($first['snapshotId'],$queued['snapshotId']);
             self::assertSame($checkpoint,hash_file('sha256',$job.'/job.json'));
             self::assertSame($before,json_decode(file_get_contents($job.'/interrupted-operation.json'),true));
-            $old=$this->evalWp('echo json_encode((new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->find('.var_export($id,true).'));');
-            self::assertSame('interrupted',$old['status']);
-            self::assertSame('scheduled_released',end($old['events'])['code']);
+            if ($fault === 'corruptHistory') {
+                self::assertSame('{"corrupt":', file_get_contents($journal));
+                // The journal stays intact. Restore the fixture journal to inspect completion below.
+                file_put_contents($journal, json_encode($data, JSON_THROW_ON_ERROR));
+            } else {
+                $old=$this->evalWp('echo json_encode((new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->find('.var_export($id,true).'));');
+                self::assertSame('interrupted',$old['status']);
+                self::assertSame('scheduled_released',end($old['events'])['code']);
+            }
         }
         $done=$worker('resume','healthy');
         self::assertNull($done['error']); self::assertSame('complete',$done['state']['status']);
@@ -397,7 +513,7 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
             $tick(); self::assertFileExists($marker);
             self::assertTrue(touch($marker,time()-32*86400));
             $tick();
-            if ($fault === 'legacy403') { self::assertFileExists($job.'/job.json'); }
+            if (in_array($fault, ['legacy403', 'legacyMissingHistory'], true)) { self::assertFileExists($job.'/job.json'); }
             else { self::assertDirectoryDoesNotExist($job); }
         }
         if ($fault === 'manual') {
@@ -413,7 +529,229 @@ final class BackupSchedulerLaunchIntegrationTest extends TestCase
 
     public function interruptedSlots(): array
     {
-        return [['terminated'], ['forbidden'], ['exhausted'], ['legacy'], ['settings'], ['revision'], ['legacy403'], ['missingHistory'], ['damaged'], ['manual']];
+        return [['terminated'], ['forbidden'], ['exhausted'], ['legacy'], ['settings'], ['revision'], ['legacy403'], ['missingHistory'], ['legacyMissingHistory'], ['corruptHistory'], ['longRetry'], ['nullCheckpoint'], ['damaged'], ['manual'], ['recreatedHistory']];
+    }
+
+    public function testPersistentFailuresCanOnlyOccupyTwoLocalWorkspaces(): void
+    {
+        [$plugin, $config] = $this->prepare();
+        $workspace = $this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo json_encode(["path"=>WordPressR2Backup\LiveSettings::workspace()]);')['path'];
+        $pressure=$this->scratch.'/pressured';
+        $mu=$this->wp->root().'/wp-content/mu-plugins'; self::assertTrue(mkdir($mu,0700));
+        file_put_contents($mu.'/capacity.php','<?php namespace WordPressR2Backup; function disk_free_space($path) {'
+            .'return is_file('.var_export($pressure,true).') ? 4096 : \\disk_free_space($path); }');
+        $store = $this->scratch.'/cipher-store'; self::assertTrue(mkdir($store,0700));
+        $legacy = $workspace.'/job-'.str_repeat('f',64); self::assertTrue(mkdir($legacy,0700));
+        file_put_contents($legacy.'/existing.age','protected');
+        $read = fn (): array => $this->evalWp('echo json_encode(get_option("wrb_live_operation"));');
+        $tick = function () use ($plugin): void {
+            $result = $this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
+            self::assertSame(0,$result['exit'],$result['err']);
+        };
+        $worker = function (string $action, string $fault) use ($store): array {
+            return $this->evalWp('$directory='.var_export($store,true).'; $action='.var_export($action,true).'; $fault='.var_export($fault,true).';'
+                .'require '.var_export(__DIR__.'/fixtures/scheduled-cipher-put.php',true).';');
+        };
+        $priorTime=time()-3600;
+        $nextSlot = function () use ($workspace,$tick,$config,$priorTime): void {
+            $this->evalWp('$s=get_option("wrb_live_operation"); if(is_array($s)) {'
+                .'foreach (["queuedAt","transferStoppedAt"] as $key) if(isset($s[$key])) $s[$key]='.(string)$priorTime.';'
+                .'update_option("wrb_live_operation",$s,false); } echo "{}";');
+
+            $path = $workspace.'/backup-history.json';
+            if (file_exists($path)) {
+                $journal=json_decode(file_get_contents($path),true,16,JSON_THROW_ON_ERROR);
+                foreach ($journal['runs'] as &$run) {
+                    $run['updatedAt']=$run['scheduledAt']=$run['schedule']['slot']=gmdate('Y-m-d\TH:i:s\Z',time()-3600);
+                }
+                unset($run);
+                file_put_contents($path,json_encode($journal,JSON_THROW_ON_ERROR));
+            }
+            // Use a distinct revision for each simulated slot so its skip retains its own history ID.
+            $config['revision']=bin2hex(random_bytes(32)); $config['time']=gmdate('H:i');
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); update_option("wrb_live_schedule",'.var_export($config,true).',false); echo "{}";');
+            $tick();
+        };
+        $nextSlot();
+        $first = $worker('capture','healthy')['state'];
+        $firstFailure = $worker('step','forbidden'); self::assertSame('R2 returned HTTP 403.', $firstFailure['error']);
+        $nextSlot();
+        $second = $worker('capture','healthy')['state'];
+        self::assertNotSame($first['id'],$second['id']);
+        $secondFailure = $worker('step','forbidden'); self::assertSame('R2 returned HTTP 403.', $secondFailure['error']);
+        foreach (['queuedAt','transferStoppedAt'] as $key) {
+            if (isset($secondFailure['state'][$key])) { $secondFailure['state'][$key]=$priorTime; }
+        }
+        $firstDir = $workspace.'/job-'.$first['id']; $secondDir = $workspace.'/job-'.$second['id'];
+        $firstSum=hash_file('sha256',$firstDir.'/job.json'); $secondSum=hash_file('sha256',$secondDir.'/job.json');
+        $remoteBefore=glob($store.'/*');
+        for ($i=0;$i<3;++$i) {
+            $nextSlot();
+            self::assertSame($secondFailure['state'],$read());
+            $status=$this->evalWp('echo json_encode(get_option("wrb_live_schedule_runner"));');
+            self::assertSame('skipped',$status['lastResult']); self::assertStringContainsString('2世代',$status['message']);
+            $history=$this->evalWp('echo json_encode((new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->latest());');
+            self::assertSame('schedule_retained_limit',end($history['events'])['code']);
+            self::assertFileDoesNotExist($secondDir.'/interrupted-operation.json');
+            self::assertCount(3,glob($workspace.'/job-*')); // Two interrupted jobs and the pre-existing directory.
+        }
+        self::assertSame($firstSum,hash_file('sha256',$firstDir.'/job.json')); self::assertSame($secondSum,hash_file('sha256',$secondDir.'/job.json'));
+        self::assertSame($remoteBefore,glob($store.'/*'));
+        // Both admission limits are active. Resuming the current transfer still makes no new capture or workspace.
+        touch($pressure);
+        $resumed=$this->evalWp('echo json_encode((new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()))->resume());');
+        self::assertSame($second['snapshotId'],$resumed['snapshotId']); self::assertSame($second['completed'],$resumed['completed']);
+        $thirdFailure=$worker('resume','forbidden');
+        self::assertSame('R2 returned HTTP 403.',$thirdFailure['error']);
+        self::assertSame($second['id'],$thirdFailure['state']['id']);
+        self::assertSame($secondSum,hash_file('sha256',$secondDir.'/job.json'));
+        unlink($pressure);
+        touch($firstDir.'/interrupted-operation.json',time()-31*86400);
+        $tick(); self::assertDirectoryDoesNotExist($firstDir); self::assertFileExists($secondDir.'/job.json');
+        $nextSlot(); self::assertNotSame($second['id'],$read()['id']);
+        $done=$worker('resume','healthy'); self::assertSame('complete',$done['state']['status']);
+        self::assertContains('final_verification',array_column($done['events'],'code'));
+        self::assertSame('protected',file_get_contents($legacy.'/existing.age'));
+    }
+
+    public function testLowFreeSpaceStopsNewCaptureAndKeepsTheCurrentGeneration(): void
+    {
+        [$plugin,$config]=$this->prepare();
+        $mu=$this->wp->root().'/wp-content/mu-plugins'; self::assertTrue(mkdir($mu,0700));
+        $space=$this->scratch.'/free-space';
+        file_put_contents($mu.'/disk-space.php','<?php namespace WordPressR2Backup; function disk_free_space($path) {'
+            .'$n=file_get_contents('.var_export($space,true).'); static $calls=0; ++$calls; if ($n==="boundary") return in_array("encryptStream",array_column(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS),"function"),true) ? 1073741824+65536 : 2147483648.0; if ($n==="during") return $calls===1 ? 2147483648.0 : 4096.0; if ($n==="nan") return NAN; if ($n==="infinite") return INF; return $n==="unknown" ? false : (float)$n; }');
+        $previous=['status'=>'complete','id'=>str_repeat('d',64),'snapshotId'=>str_repeat('e',64),'localCipherBytes'=>64*1024*1024];
+        $this->evalWp('update_option("wrb_live_operation",'.var_export($previous,true).',false); echo "{}";');
+        $tick = function (bool $disabled = false) use ($plugin,$config): array {
+            $config['revision']=bin2hex(random_bytes(32)); $config['time']=gmdate('H:i');
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); update_option("wrb_live_schedule",'.var_export($config,true).',false); echo "{}";');
+            $command=[PHP_BINARY,'-d','sys_temp_dir='.$this->scratch];
+            if ($disabled) { $command[]='-d'; $command[]='disable_functions=disk_free_space'; }
+            $r=$this->process(array_merge($command,[$plugin.'/schedule.php',$this->wp->root()]));
+            self::assertSame(0,$r['exit'],$r['err']);
+            return $this->evalWp('echo json_encode(["runner"=>get_option("wrb_live_schedule_runner"),"active"=>get_option("wrb_live_operation"),'
+                .'"history"=>(new WordPressR2Backup\BackupHistory(WordPressR2Backup\LiveSettings::workspace()))->latest()]);');
+        };
+        foreach (['unknown','nan','infinite',-1,64*1024*1024,1073741824+1024] as $free) {
+            file_put_contents($space,(string)$free); $result=$tick();
+            self::assertSame('skipped',$result['runner']['lastResult']); self::assertSame($previous,$result['active']);
+            self::assertSame('schedule_low_space',end($result['history']['events'])['code']);
+        }
+        file_put_contents($space,(string)(2*1073741824));
+        $disabled=$tick(true); self::assertSame('skipped',$disabled['runner']['lastResult']);
+        self::assertSame($previous,$disabled['active']); self::assertSame('schedule_low_space',end($disabled['history']['events'])['code']);
+        $result=$tick();
+        self::assertSame('started',$result['runner']['lastResult']); self::assertSame('queued',$result['active']['status']);
+        foreach (['during','boundary'] as $phase) {
+            if ($phase==='boundary') { $result=$tick(); self::assertSame('started',$result['runner']['lastResult']); }
+            file_put_contents($space,$phase);
+            $paused=$this->evalWp('$b=new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load()); $a=$b->state();'
+                .'try { $b->begin($a["launchId"]); } catch (WordPressR2Backup\ScheduledStorageLimit $e) {}'
+                .'echo json_encode(["state"=>$b->state(),"history"=>(new WordPressR2Backup\BackupHistory($b->workspace()))->find($a["id"]),'
+                .'"marker"=>is_file($b->workspace()."/job-".$a["id"]."/interrupted-operation.json")]);');
+            self::assertSame('failed',$paused['state']['status']); self::assertFalse($paused['marker']);
+            self::assertSame('capture_low_space',end($paused['history']['events'])['code']);
+            file_put_contents($space,(string)(2*1073741824));
+        }
+    }
+
+    public function testFailedScheduledCapturesCleanTheirOwnPartialCiphertextAndRecoverAfterRestart(): void
+    {
+        [$plugin,$config]=$this->prepare();
+        $scope=$this->evalWp('$s=WordPressR2Backup\LiveSettings::load(); $s["policy"]["preset"]="custom";'
+            .'$s["policy"]["paths"]=["wp-admin"=>"exclude","wp-includes"=>"exclude","wp-content"=>"exclude"];'
+            .'WordPressR2Backup\LiveSettings::save($s); echo json_encode(["path"=>WordPressR2Backup\LiveSettings::workspace()]);')['path'];
+        $mu=$this->wp->root().'/wp-content/mu-plugins'; self::assertTrue(mkdir($mu,0700));
+        // age publishes ciphertext atomically with link(). Fail the next encryption after one real file is durable.
+        $fault=$this->scratch.'/fail-capture'; touch($fault);
+        $evidence=$this->scratch.'/published-cipher';
+        $obstruct=$this->scratch.'/block-cleanup';
+        $kill=$this->scratch.'/crash-before-checkpoint';
+        file_put_contents($mu.'/fail-capture.php','<?php namespace WordPressR2Backup; function link($source,$destination) { static $n=0;'
+            .'if (is_file('.var_export($fault,true).') && str_ends_with($destination,".age") && ++$n===2) {if(is_file('.var_export($kill,true).')) exit(77); return false;}'
+            .'$ok=\\link($source,$destination); if ($ok && str_ends_with($destination,".age")) file_put_contents('.var_export($evidence,true).',filesize($destination)); return $ok; }'
+            .'function unlink($path) { if (is_file('.var_export($obstruct,true).') && str_ends_with($path,".age")) return false; return \\unlink($path); }'
+            .'function rename($source,$dest) { if (is_file('.var_export($obstruct,true).') && basename($dest)==="interrupted-operation.json") return false; return \\rename($source,$dest); }');
+        $tick=function () use ($plugin): array {
+            $r=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$plugin.'/schedule.php',$this->wp->root()]);
+            self::assertSame(0,$r['exit'],$r['err']);
+            return $this->evalWp('echo json_encode(["runner"=>get_option("wrb_live_schedule_runner"),"active"=>get_option("wrb_live_operation")]);');
+        };
+        $slot=function () use ($tick,$config): array {
+            $config['revision']=bin2hex(random_bytes(32)); $config['time']=gmdate('H:i');
+            $this->evalWp('delete_option("wrb_live_schedule_runner"); update_option("wrb_live_schedule",'.var_export($config,true).',false); echo "{}";');
+            return $tick();
+        };
+        $store=$this->scratch.'/healthy-r2'; self::assertTrue(mkdir($store,0700));
+        $healthy=function () use ($slot,$store): void {
+            $queued=$slot(); self::assertSame('started',$queued['runner']['lastResult']);
+            $done=$this->evalWp('$directory='.var_export($store,true).'; $action="resume"; $fault="healthy";'
+                .'require '.var_export(__DIR__.'/fixtures/scheduled-cipher-put.php',true).';');
+            self::assertSame('complete',$done['state']['status']); self::assertContains('final_verification',array_column($done['events'],'code'));
+        };
+        foreach (['fail','healthy','fail','healthy','fail','fail','obstructed','healthy'] as $scenario) {
+            if ($scenario==='healthy') { if (is_file($fault)) { unlink($fault); } $healthy(); continue; }
+            touch($fault); if (is_file($evidence)) { unlink($evidence); }
+            if ($scenario==='obstructed') { touch($obstruct); }
+            $start=$slot(); self::assertSame('started',$start['runner']['lastResult']);
+            $id=$start['active']['id']; $directory=$scope.'/job-'.$id;
+            $finish=$this->evalWp('$b=new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load());'
+                .'$error=null; try {$b->begin($b->state()["launchId"]);} catch (RuntimeException $e) {$error=$e->getMessage();}'
+                .'echo json_encode(["error"=>$error,"state"=>$b->state(),"history"=>(new WordPressR2Backup\BackupHistory($b->workspace()))->find('.var_export($id,true).')]);');
+            self::assertGreaterThan(0,(int)file_get_contents($evidence));
+            self::assertSame('Cannot publish age output without replacement.',$finish['error']);
+            self::assertSame('failed',$finish['state']['status']); self::assertSame('capture_failed',end($finish['history']['events'])['code']);
+            if ($scenario==='obstructed') {
+                self::assertFileExists($directory.'/capture-owner.json'); self::assertFileDoesNotExist($directory.'/interrupted-operation.json');
+                unlink($obstruct);
+                // An active manual takeover, a checkpoint, a ready guard or a directory identity mismatch must veto cleanup.
+                $setManual = function (bool $manual): void {
+                    $this->evalWp('$a=get_option("wrb_live_operation"); $a["manualResume"]='.var_export($manual,true).';'
+                        .'update_option("wrb_live_operation",$a,false); echo "{}";');
+                };
+                $setManual(true); $tick(); self::assertDirectoryExists($directory); $setManual(false);
+                foreach (['job.json','capture-ready'] as $name) {
+                    touch($directory.'/'.$name); $tick(); self::assertDirectoryExists($directory); unlink($directory.'/'.$name);
+                }
+                $path=$directory.'/capture-owner.json'; $saved=file_get_contents($path);
+                $invalid=json_decode($saved,true); ++$invalid['ino']; file_put_contents($path,json_encode($invalid));
+                $tick(); self::assertDirectoryExists($directory); file_put_contents($path,$saved);
+                $lock=fopen($scope.'/runner.lock','c+b'); self::assertTrue(flock($lock,LOCK_EX|LOCK_NB));
+                try { $tick(); self::assertDirectoryExists($directory); } finally { fclose($lock); }
+                $tick(); // Fresh scheduler process completes the previously obstructed cleanup.
+            }
+            self::assertDirectoryDoesNotExist($directory);
+        }
+
+        touch($fault); touch($kill);
+        $queued=$slot(); $id=$queued['active']['id']; $abandoned=$scope.'/job-'.$id;
+        $script=$this->scratch.'/crash-capture.php';
+        file_put_contents($script,'<?php require '.var_export($this->wp->root().'/wp-load.php',true).';'
+            .'$b=new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load()); $b->begin($b->state()["launchId"]);');
+        $dead=$this->process([PHP_BINARY,'-d','sys_temp_dir='.$this->scratch,$script]); self::assertSame(77,$dead['exit']);
+        self::assertFileExists($abandoned.'/capture-owner.json'); self::assertFileDoesNotExist($abandoned.'/capture-ready');
+        $journalPath=$scope.'/backup-history.json';
+        $data=json_decode(file_get_contents($journalPath),true);
+        $time=gmdate('Y-m-d\TH:i:s\Z',time()-3600);
+        foreach ($data['runs'] as &$run) {
+            if ($run['id']===$id) { $run['updatedAt']=$run['scheduledAt']=$run['schedule']['slot']=$time; }
+        }
+        unset($run); file_put_contents($journalPath,json_encode($data));
+        $this->evalWp('$s=get_option("wrb_live_operation"); $s["startedAt"]='.var_export($time,true).'; $s["queuedAt"]=time()-3600;'
+            .'update_option("wrb_live_operation",$s,false); echo "{}";');
+        unlink($kill); unlink($fault);
+        $healthy(); self::assertDirectoryDoesNotExist($abandoned);
+
+        // A manual online capture has no scheduled owner marker. Even its unsealed partial output remains untouched.
+        touch($fault);
+        $manual=$this->evalWp('$b=new WordPressR2Backup\LiveBackup(WordPressR2Backup\LiveSettings::load());'
+            .'$r=new WordPressR2Backup\LiveRunner(WordPressR2Backup\LiveSettings::load()); $s=$r->startOnline();'
+            .'try {$b->begin($s["launchId"]);} catch (RuntimeException $e) {} echo json_encode($b->state());');
+        self::assertSame('failed',$manual['status']); $manualPath=$scope.'/job-'.$manual['id'];
+        $tick(); self::assertDirectoryExists($manualPath); self::assertFileDoesNotExist($manualPath.'/capture-owner.json');
     }
 
 }

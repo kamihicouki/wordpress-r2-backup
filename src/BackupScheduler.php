@@ -76,7 +76,8 @@ final class BackupScheduler
     {
         FileSafety::privateDirectory($workspace);
         $path = $workspace . '/' . $name; FileSafety::assertNoLinks($path);
-        $lock = @fopen($path, 'c+b');
+        // A detached worker may outlive this scheduler, including after SIGKILL.
+        $lock = @fopen($path, 'c+be');
         if ($lock === false || !chmod($path, 0600) || !flock($lock, LOCK_EX | LOCK_NB)) {
             if (is_resource($lock)) { fclose($lock); }
             throw new \RuntimeException('別のバックアップ処理が実行中です。');
