@@ -45,7 +45,7 @@ final class BackupHistory
         'capture_unsupported_engine' => ['failed', '保守なしで取得できない形式のデータベーステーブルがあり、取得を中止しました。'],
         'transfer_connection' => ['interrupted', 'R2への接続が途切れました。保存済みの位置から転送を再開できます。'],
         'transfer_failed' => ['interrupted', '転送または照合を完了できませんでした。保存済みの位置から転送を再開できます。'],
-        'schedule_storage_wait' => ['skipped', '保存先への再試行時刻に達していないため、接続先への新しい定期実行も見送りました。'], 
+        'schedule_storage_wait' => ['skipped', '保存先への再試行時刻に達していないため、接続先への新しい定期実行も見送りました。'],
         'schedule_skipped' => ['skipped', '他のバックアップ処理があるため、定期実行を見送りました。'],
         'schedule_failed' => ['failed', '定期バックアップを起動できませんでした。'],
         'schedule_unavailable' => ['skipped', '実行に必要な設定または実行環境を確認できませんでした。'],
