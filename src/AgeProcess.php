@@ -10,18 +10,20 @@ final class AgeProcess
 {
     private const TIMEOUT_SECONDS = 300;
     private string $binary;
+    private $beforeEncryptStream;
     /** Elapsed time, calls and plaintext bytes of encryptStream(), for measurement only; never read back by any check. */
     private int $streamNanoseconds = 0;
     private int $streamCalls = 0;
     private int $streamPlainBytes = 0;
 
-    public function __construct(string $verifiedAgeBinary)
+    public function __construct(string $verifiedAgeBinary, ?callable $beforeEncryptStream = null)
     {
         $binary = realpath($verifiedAgeBinary);
         if ($binary === false || !is_file($binary) || !is_executable($binary)) {
             throw new RuntimeException('The verified age executable is unavailable.');
         }
         $this->binary = $binary;
+        $this->beforeEncryptStream = $beforeEncryptStream;
     }
 
     public function encrypt(string $plainFile, string $cipherFile, array $recipients): void
@@ -46,6 +48,7 @@ final class AgeProcess
 
     public function encryptStream(iterable $chunks, string $cipherFile, array $recipients): array
     {
+        if ($this->beforeEncryptStream !== null) { ($this->beforeEncryptStream)(); }
         $command = $this->encryptionCommand($recipients);
         $command[] = '-';
         $plainBytes = 0;

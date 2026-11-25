@@ -61,7 +61,7 @@ try {
                 && in_array($active['status'] ?? '', ['queued', 'capturing', 'uploading'], true);
             // Look for a retained workspace only on idle ticks, outside a due slot and pending retry.
             $cleanup = $slot === null && !in_array($active['status'] ?? '', ['queued', 'capturing', 'uploading'], true)
-                && (bool) glob($workspace . '/job-*/interrupted-operation.json', GLOB_NOSORT);
+                && (glob($workspace . '/job-*/interrupted-operation.json', GLOB_NOSORT) || glob($workspace . '/job-*/capture-owner.json', GLOB_NOSORT));
             if ($unfinished || $cleanup) {
                 try {
                     \WordPressR2Backup\BackupScheduler::assertOnlineRelease(__DIR__);
